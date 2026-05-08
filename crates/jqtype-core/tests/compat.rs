@@ -1,0 +1,353 @@
+//! Compatibility harness: run a real jq on curated samples and verify that
+//! every concrete output value fits the type inferred by `jqtype-core`.
+//!
+//! This is the soundness backstop the implementation plan calls for in
+//! Milestone 7. If jq disagrees with the static analyzer, the inferred type
+//! excludes a possible runtime output and we have a soundness bug.
+//!
+//! The harness skips itself when no `jq` binary is installed.
+
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+use jqtype_core::{
+    AnalyzeOptions, Cardinality, InputShape, JqTypeChecker, StreamType, value_fits_type,
+};
+use serde_json::{Value, json};
+
+struct Case {
+    name: &'static str,
+    filter: &'static str,
+    input_schema: Value,
+    inputs: Vec<Value>,
+}
+
+fn cases() -> Vec<Case> {
+    let users_schema = json!({
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "number" },
+                        "name": { "type": "string" }
+                    },
+                    "required": ["id", "name"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["items"],
+        "additionalProperties": false
+    });
+
+    let users_sample = json!({
+        "items": [
+            { "id": 1, "name": "Ada" },
+            { "id": 2, "name": "Grace" }
+        ]
+    });
+
+    let empty_users = json!({ "items": [] });
+
+    let discriminated_schema = json!({
+        "type": "array",
+        "items": {
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "type": { "enum": ["user"] },
+                        "name": { "type": "string" }
+                    },
+                    "required": ["type", "name"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "type": { "enum": ["org"] },
+                        "org_name": { "type": "string" }
+                    },
+                    "required": ["type", "org_name"],
+                    "additionalProperties": false
+                }
+            ]
+        }
+    });
+
+    let discriminated_sample = json!([
+        { "type": "user", "name": "Ada" },
+        { "type": "org", "org_name": "Anthropic" },
+        { "type": "user", "name": "Grace" }
+    ]);
+
+    let active_schema = json!({
+        "type": "object",
+        "properties": {
+            "active": { "type": "boolean" },
+            "name": { "type": "string" }
+        },
+        "required": ["active", "name"],
+        "additionalProperties": false
+    });
+
+    let nullable_foo_schema = json!({
+        "type": "object",
+        "properties": {
+            "foo": { "type": ["string", "null"] }
+        },
+        "required": ["foo"],
+        "additionalProperties": false
+    });
+
+    vec![
+        Case {
+            name: "identity",
+            filter: ".",
+            input_schema: users_schema.clone(),
+            inputs: vec![users_sample.clone(), empty_users.clone()],
+        },
+        Case {
+            name: "field projection",
+            filter: ".items",
+            input_schema: users_schema.clone(),
+            inputs: vec![users_sample.clone(), empty_users.clone()],
+        },
+        Case {
+            name: "iterate items",
+            filter: ".items[]",
+            input_schema: users_schema.clone(),
+            inputs: vec![users_sample.clone(), empty_users.clone()],
+        },
+        Case {
+            name: "collect projection",
+            filter: "[.items[].name]",
+            input_schema: users_schema.clone(),
+            inputs: vec![users_sample.clone(), empty_users.clone()],
+        },
+        Case {
+            name: "object construction",
+            filter: ".items[] | {id, name}",
+            input_schema: users_schema.clone(),
+            inputs: vec![users_sample.clone(), empty_users.clone()],
+        },
+        Case {
+            name: "if then else over booleans",
+            filter: "if .active then .name else null end",
+            input_schema: active_schema.clone(),
+            inputs: vec![
+                json!({"active": true, "name": "Ada"}),
+                json!({"active": false, "name": "Grace"}),
+            ],
+        },
+        Case {
+            name: "select on discriminated union",
+            filter: ".[] | select(.type == \"user\") | .name",
+            input_schema: discriminated_schema.clone(),
+            inputs: vec![discriminated_sample.clone(), json!([])],
+        },
+        Case {
+            name: "comma combines streams",
+            filter: ".items[0].id, .items[0].name",
+            input_schema: users_schema.clone(),
+            inputs: vec![users_sample.clone()],
+        },
+        Case {
+            name: "map projection",
+            filter: ".items | map(.id)",
+            input_schema: users_schema.clone(),
+            inputs: vec![users_sample.clone(), empty_users.clone()],
+        },
+        Case {
+            name: "type builtin",
+            filter: ".items[] | type",
+            input_schema: users_schema.clone(),
+            inputs: vec![users_sample.clone()],
+        },
+        Case {
+            name: "length builtin",
+            filter: ".items | length",
+            input_schema: users_schema.clone(),
+            inputs: vec![users_sample.clone(), empty_users.clone()],
+        },
+        Case {
+            name: "keys on object",
+            filter: ".items[0] | keys",
+            input_schema: users_schema.clone(),
+            inputs: vec![users_sample.clone()],
+        },
+        Case {
+            name: "empty produces no outputs",
+            filter: "empty",
+            input_schema: users_schema.clone(),
+            inputs: vec![users_sample.clone()],
+        },
+        Case {
+            name: "select non-null then field",
+            filter: "select(.foo != null) | .foo",
+            input_schema: nullable_foo_schema.clone(),
+            inputs: vec![json!({"foo": "x"}), json!({"foo": null})],
+        },
+        Case {
+            name: "string filter narrows union",
+            filter: ".foo | strings",
+            input_schema: nullable_foo_schema,
+            inputs: vec![json!({"foo": "x"}), json!({"foo": null})],
+        },
+        Case {
+            // jq's `+` is overloaded across numbers/strings/arrays/objects;
+            // the analyzer widens to Unknown rather than guessing.
+            name: "math op stays sound on string concat",
+            filter: ".items[0].name + \"!\"",
+            input_schema: users_schema,
+            inputs: vec![users_sample],
+        },
+    ]
+}
+
+fn jq_available() -> bool {
+    Command::new("jq")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn run_jq(filter: &str, input: &Value) -> Result<Vec<Value>, String> {
+    let mut child = Command::new("jq")
+        .arg("-c")
+        .arg(filter)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to spawn jq: {err}"))?;
+
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "missing jq stdin".to_string())?;
+        stdin
+            .write_all(serde_json::to_string(input).unwrap().as_bytes())
+            .map_err(|err| format!("failed to write jq stdin: {err}"))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("failed to wait on jq: {err}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "jq exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|err| format!("jq stdout was not utf-8: {err}"))?;
+
+    stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<Value>(line)
+                .map_err(|err| format!("could not parse jq output line `{line}`: {err}"))
+        })
+        .collect()
+}
+
+#[test]
+fn jq_outputs_fit_inferred_types() {
+    if !jq_available() {
+        eprintln!("skipping compatibility harness: `jq` not found in PATH");
+        return;
+    }
+
+    let checker = JqTypeChecker::new();
+    let mut failures: Vec<String> = Vec::new();
+
+    for case in cases() {
+        let report = checker.analyze_filter(
+            case.filter,
+            InputShape::from_json_schema(case.input_schema.clone()),
+            AnalyzeOptions::default(),
+        );
+
+        if report.has_errors() {
+            failures.push(format!(
+                "case `{}`: analysis produced errors: {:?}",
+                case.name, report.diagnostics
+            ));
+            continue;
+        }
+
+        let stream: &StreamType = report.output_type();
+
+        for (index, input) in case.inputs.iter().enumerate() {
+            let outputs = match run_jq(case.filter, input) {
+                Ok(outputs) => outputs,
+                Err(err) => {
+                    failures.push(format!(
+                        "case `{}` input #{index}: jq invocation failed: {err}",
+                        case.name
+                    ));
+                    continue;
+                }
+            };
+
+            if !stream.card.fits_count(outputs.len()) {
+                failures.push(format!(
+                    "case `{}` input #{index}: produced {} outputs, which does not fit cardinality {:?} (inferred type {})",
+                    case.name,
+                    outputs.len(),
+                    stream.card,
+                    stream.to_compact_string()
+                ));
+                continue;
+            }
+
+            for (output_index, value) in outputs.iter().enumerate() {
+                if !value_fits_type(value, &stream.item) {
+                    failures.push(format!(
+                        "case `{}` input #{index} output #{output_index}: value {value} does not fit inferred item type {}",
+                        case.name,
+                        stream.item.to_compact_string()
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} compatibility failure(s):\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn cardinality_fits_count_matrix() {
+    use Cardinality::*;
+    assert!(Zero.fits_count(0));
+    assert!(!Zero.fits_count(1));
+    assert!(One.fits_count(1));
+    assert!(!One.fits_count(0));
+    assert!(!One.fits_count(2));
+    assert!(ZeroOrOne.fits_count(0));
+    assert!(ZeroOrOne.fits_count(1));
+    assert!(!ZeroOrOne.fits_count(2));
+    assert!(!OneOrMore.fits_count(0));
+    assert!(OneOrMore.fits_count(1));
+    assert!(OneOrMore.fits_count(7));
+    assert!(ZeroOrMore.fits_count(0));
+    assert!(ZeroOrMore.fits_count(1));
+    assert!(ZeroOrMore.fits_count(99));
+}

@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "crates/jqtype-core",
+    "crates/jqtype-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"

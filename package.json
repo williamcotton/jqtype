@@ -1,0 +1,19 @@
+{
+  "name": "jqtype-workspace",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Repo-level scripts for the jqtype project. Houses the cross-implementation compatibility harness that exercises both jqtype-rs and jqtype-ts against real jq.",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run --root .",
+    "test:watch": "vitest --root ."
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.2",
+    "typescript": "^6.0.3",
+    "vitest": "^3.2.4"
+  },
+  "workspaces": [
+    "jqtype-ts"
+  ]
+}

@@ -1,5 +1,5 @@
 {
-  "name": "jqtype-ts",
+  "name": "jqtype",
   "version": "0.1.0",
   "description": "TypeScript port of jqtype: static type analysis for jq filters, intended for embedding in language servers.",
   "type": "module",
@@ -17,6 +17,8 @@
   ],
   "scripts": {
     "build": "tsc",
+    "prepack": "npm run build",
+    "clean": "rm -rf dist",
     "check": "tsc --noEmit",
     "dev": "tsx watch src/index.ts",
     "test": "vitest run",

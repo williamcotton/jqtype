@@ -110,6 +110,78 @@ const nullableFooSchema = {
   additionalProperties: false,
 };
 
+const routeParamsSchema = {
+  type: "object",
+  properties: {
+    params: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  required: ["params"],
+  additionalProperties: false,
+};
+
+const rowsByTeamSchema = {
+  type: "object",
+  properties: {
+    data: {
+      type: "object",
+      properties: {
+        rows: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              team_id: { type: ["string", "number"] },
+              name: { type: "string" },
+            },
+            required: ["team_id", "name"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["rows"],
+      additionalProperties: false,
+    },
+  },
+  required: ["data"],
+  additionalProperties: false,
+};
+
+const hourlyWeatherSchema = {
+  type: "object",
+  properties: {
+    data: {
+      type: "object",
+      properties: {
+        response: {
+          type: "object",
+          properties: {
+            hourly: {
+              type: "object",
+              properties: {
+                time: { type: "array", items: { type: "string" } },
+                temperature_2m: { type: "array", items: { type: "number" } },
+              },
+              required: ["time", "temperature_2m"],
+              additionalProperties: false,
+            },
+          },
+          required: ["hourly"],
+          additionalProperties: false,
+        },
+      },
+      required: ["response"],
+      additionalProperties: false,
+    },
+  },
+  required: ["data"],
+  additionalProperties: false,
+};
+
 const cases: Case[] = [
   {
     name: "identity",
@@ -207,6 +279,77 @@ const cases: Case[] = [
   {
     name: "math op stays sound on string concat",
     filter: '.items[0].name + "!"',
+    inputSchema: usersSchema,
+    inputs: [usersSample],
+  },
+  {
+    name: "conversion and string concat",
+    filter: '{ id: (.params.id | tonumber), label: ("Team " + (.params.id | tostring)) }',
+    inputSchema: routeParamsSchema,
+    inputs: [{ params: { id: "42" } }],
+  },
+  {
+    name: "identity-root assignment",
+    filter: ".graphqlParams = { id: 1 }",
+    inputSchema: routeParamsSchema,
+    inputs: [{ params: { id: "42" } }],
+  },
+  {
+    name: "as binding with transpose",
+    filter:
+      ".data.response.hourly as $h | [$h.time, $h.temperature_2m] | transpose | map({time: .[0], temp: .[1]})",
+    inputSchema: hourlyWeatherSchema,
+    inputs: [
+      {
+        data: {
+          response: {
+            hourly: {
+              time: ["2026-01-09T00:00", "2026-01-09T01:00"],
+              temperature_2m: [-4.2, -4.4],
+            },
+          },
+        },
+      },
+    ],
+  },
+  {
+    name: "reduce dynamic grouping update",
+    filter:
+      "reduce .data.rows[] as $row ({}; .[$row.team_id | tostring] += [$row])",
+    inputSchema: rowsByTeamSchema,
+    inputs: [
+      {
+        data: {
+          rows: [
+            { team_id: 1, name: "Platform" },
+            { team_id: 1, name: "Growth" },
+            { team_id: 2, name: "Security" },
+          ],
+        },
+      },
+      { data: { rows: [] } },
+    ],
+  },
+  {
+    name: "slice interpolation and fallback",
+    filter: '{ preview: (.body | .[0:5] + "..."), source: (.source // "fallback") }',
+    inputSchema: {
+      type: "object",
+      properties: {
+        body: { type: "string" },
+        source: { type: ["string", "null"] },
+      },
+      required: ["body", "source"],
+      additionalProperties: false,
+    },
+    inputs: [
+      { body: "abcdefgh", source: "primary" },
+      { body: "abc", source: null },
+    ],
+  },
+  {
+    name: "add and join builtins",
+    filter: '{ total: ([10, 20, 30] | add), joined: (.items | map(.id | tostring) | join(",")) }',
     inputSchema: usersSchema,
     inputs: [usersSample],
   },

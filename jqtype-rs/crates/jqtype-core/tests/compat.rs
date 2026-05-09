@@ -103,6 +103,78 @@ fn cases() -> Vec<Case> {
         "additionalProperties": false
     });
 
+    let route_params_schema = json!({
+        "type": "object",
+        "properties": {
+            "params": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"],
+                "additionalProperties": false
+            }
+        },
+        "required": ["params"],
+        "additionalProperties": false
+    });
+
+    let rows_by_team_schema = json!({
+        "type": "object",
+        "properties": {
+            "data": {
+                "type": "object",
+                "properties": {
+                    "rows": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "team_id": { "type": ["string", "number"] },
+                                "name": { "type": "string" }
+                            },
+                            "required": ["team_id", "name"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["rows"],
+                "additionalProperties": false
+            }
+        },
+        "required": ["data"],
+        "additionalProperties": false
+    });
+
+    let hourly_weather_schema = json!({
+        "type": "object",
+        "properties": {
+            "data": {
+                "type": "object",
+                "properties": {
+                    "response": {
+                        "type": "object",
+                        "properties": {
+                            "hourly": {
+                                "type": "object",
+                                "properties": {
+                                    "time": { "type": "array", "items": { "type": "string" } },
+                                    "temperature_2m": { "type": "array", "items": { "type": "number" } }
+                                },
+                                "required": ["time", "temperature_2m"],
+                                "additionalProperties": false
+                            }
+                        },
+                        "required": ["hourly"],
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["response"],
+                "additionalProperties": false
+            }
+        },
+        "required": ["data"],
+        "additionalProperties": false
+    });
+
     vec![
         Case {
             name: "identity",
@@ -202,6 +274,73 @@ fn cases() -> Vec<Case> {
             // the analyzer widens to Unknown rather than guessing.
             name: "math op stays sound on string concat",
             filter: ".items[0].name + \"!\"",
+            input_schema: users_schema.clone(),
+            inputs: vec![users_sample.clone()],
+        },
+        Case {
+            name: "conversion and string concat",
+            filter: "{ id: (.params.id | tonumber), label: (\"Team \" + (.params.id | tostring)) }",
+            input_schema: route_params_schema.clone(),
+            inputs: vec![json!({"params": {"id": "42"}})],
+        },
+        Case {
+            name: "identity-root assignment",
+            filter: ".graphqlParams = { id: 1 }",
+            input_schema: route_params_schema,
+            inputs: vec![json!({"params": {"id": "42"}})],
+        },
+        Case {
+            name: "as binding with transpose",
+            filter: ".data.response.hourly as $h | [$h.time, $h.temperature_2m] | transpose | map({time: .[0], temp: .[1]})",
+            input_schema: hourly_weather_schema,
+            inputs: vec![json!({
+                "data": {
+                    "response": {
+                        "hourly": {
+                            "time": ["2026-01-09T00:00", "2026-01-09T01:00"],
+                            "temperature_2m": [-4.2, -4.4]
+                        }
+                    }
+                }
+            })],
+        },
+        Case {
+            name: "reduce dynamic grouping update",
+            filter: "reduce .data.rows[] as $row ({}; .[$row.team_id | tostring] += [$row])",
+            input_schema: rows_by_team_schema,
+            inputs: vec![
+                json!({
+                    "data": {
+                        "rows": [
+                            { "team_id": 1, "name": "Platform" },
+                            { "team_id": 1, "name": "Growth" },
+                            { "team_id": 2, "name": "Security" }
+                        ]
+                    }
+                }),
+                json!({"data": {"rows": []}}),
+            ],
+        },
+        Case {
+            name: "slice interpolation and fallback",
+            filter: "{ preview: (.body | .[0:5] + \"...\"), source: (.source // \"fallback\") }",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "body": { "type": "string" },
+                    "source": { "type": ["string", "null"] }
+                },
+                "required": ["body", "source"],
+                "additionalProperties": false
+            }),
+            inputs: vec![
+                json!({"body": "abcdefgh", "source": "primary"}),
+                json!({"body": "abc", "source": null}),
+            ],
+        },
+        Case {
+            name: "add and join builtins",
+            filter: "{ total: ([10, 20, 30] | add), joined: (.items | map(.id | tostring) | join(\",\")) }",
             input_schema: users_schema,
             inputs: vec![users_sample],
         },

@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
-use jaq_syn::filter::{BinaryOp, Filter as JaqFilter, KeyVal};
+use jaq_syn::filter::{AssignOp, BinaryOp, Filter as JaqFilter, FoldType, KeyVal};
 use jaq_syn::path::{Opt, Part};
 use jaq_syn::string;
-use jaq_syn::{OrdOp, Span, Spanned};
+use jaq_syn::{MathOp, OrdOp, Span, Spanned};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -221,6 +221,7 @@ struct Analyzer {
     options: AnalyzeOptions,
     diagnostics: Vec<Diagnostic>,
     unsupported_features: Vec<UnsupportedFeature>,
+    env: BTreeMap<String, JType>,
 }
 
 #[derive(Clone, Debug)]
@@ -235,6 +236,7 @@ impl Analyzer {
             options,
             diagnostics: Vec::new(),
             unsupported_features: Vec::new(),
+            env: BTreeMap::new(),
         }
     }
 
@@ -243,7 +245,7 @@ impl Analyzer {
         match &filter.0 {
             Filter::Id => StreamType::one(input),
             Filter::Num(value) => StreamType::one(JType::number_lit(value.clone())),
-            Filter::Str(value) => StreamType::one(self.string_type(value)),
+            Filter::Str(value) => StreamType::one(self.string_type(value, input)),
             Filter::Array(None) => StreamType::one(JType::array(JType::Never)),
             Filter::Array(Some(inner)) => {
                 let inner = self.analyze(inner, input);
@@ -269,12 +271,15 @@ impl Analyzer {
                 Filter::Num(value) => StreamType::one(JType::number_lit(format!("-{value}"))),
                 _ => StreamType::one(JType::number()),
             },
-            Filter::Var(name) => self.unsupported(
-                format!("variables are not supported yet: ${name}"),
-                span,
-                JType::Unknown,
-            ),
-            Filter::Fold(..) => self.unsupported("fold filters are not supported yet", span, input),
+            Filter::Var(name) => match self.env.get(name).cloned() {
+                Some(ty) => StreamType::one(ty),
+                None => self.unsupported(
+                    format!("variables are not supported yet: ${name}"),
+                    span,
+                    JType::Unknown,
+                ),
+            },
+            Filter::Fold(fold_type, fold) => self.analyze_fold(*fold_type, fold, input),
             Filter::Recurse => {
                 self.unsupported("recursive descent is not supported yet", span, input)
             }
@@ -400,14 +405,20 @@ impl Analyzer {
         input: JType,
     ) -> StreamType {
         match op {
-            BinaryOp::Pipe(_) => {
-                let left_stream = self.analyze(left, input);
+            BinaryOp::Pipe(binding) => {
+                let left_stream = self.analyze(left, input.clone());
                 if matches!(left_stream.card, Cardinality::Zero) {
                     return StreamType::zero();
                 }
                 let mut per_item: Option<StreamType> = None;
                 for item in flatten_union(left_stream.item.clone()) {
-                    let branch = self.analyze(right, item);
+                    let branch = if let Some(name) = binding {
+                        self.with_var(name, item, |analyzer| {
+                            analyzer.analyze(right, input.clone())
+                        })
+                    } else {
+                        self.analyze(right, item)
+                    };
                     per_item = Some(match per_item {
                         Some(existing) => existing.join_alternative(branch),
                         None => branch,
@@ -420,20 +431,114 @@ impl Analyzer {
                 .analyze(left, input.clone())
                 .join(self.analyze(right, input)),
             BinaryOp::Ord(_) | BinaryOp::Or | BinaryOp::And => StreamType::one(JType::bool()),
-            BinaryOp::Math(_) => {
-                let _ = self.analyze(left, input.clone());
-                let _ = self.analyze(right, input);
-                StreamType::one(JType::Unknown)
+            BinaryOp::Math(op) => {
+                let left = self.analyze(left, input.clone());
+                let right = self.analyze(right, input);
+                StreamType::new(
+                    math_type(*op, left.item, right.item),
+                    left.card.compose(right.card),
+                )
             }
             BinaryOp::Alt => {
                 let left = self.analyze(left, input.clone());
-                left.join(self.analyze(right, input))
+                let right = self.analyze(right, input);
+                StreamType::new(
+                    alt_type(left.item, right.item),
+                    left.card.alternative(right.card),
+                )
             }
-            BinaryOp::Assign(_) => self.unsupported(
-                "assignment operators are not supported yet",
-                left.1.clone(),
-                input,
-            ),
+            BinaryOp::Assign(op) => self.analyze_assignment(left, op, right, input),
+        }
+    }
+
+    fn with_var<T>(&mut self, name: &str, ty: JType, f: impl FnOnce(&mut Self) -> T) -> T {
+        let previous = self.env.insert(name.to_string(), ty);
+        let out = f(self);
+        match previous {
+            Some(previous) => {
+                self.env.insert(name.to_string(), previous);
+            }
+            None => {
+                self.env.remove(name);
+            }
+        }
+        out
+    }
+
+    fn analyze_fold(
+        &mut self,
+        fold_type: FoldType,
+        fold: &jaq_syn::filter::Fold<Box<SpannedFilter>>,
+        input: JType,
+    ) -> StreamType {
+        let xs = self.analyze(&fold.xs, input.clone());
+        let init = self.analyze(&fold.init, input);
+
+        if matches!(xs.card, Cardinality::Zero) {
+            return init;
+        }
+
+        let mut acc = init.item.clone();
+        let mut update_stream = StreamType::one(acc.clone());
+        for _ in 0..8 {
+            let mut per_item: Option<StreamType> = None;
+            for item in flatten_union(xs.item.clone()) {
+                let branch = self.with_var(&fold.x, item, |analyzer| {
+                    analyzer.analyze(&fold.f, acc.clone())
+                });
+                per_item = Some(match per_item {
+                    Some(existing) => existing.join_alternative(branch),
+                    None => branch,
+                });
+            }
+            update_stream = per_item.unwrap_or_else(StreamType::zero);
+            let next = JType::union([acc.clone(), update_stream.item.clone()]);
+            if next == acc {
+                break;
+            }
+            acc = next;
+        }
+
+        let card = if matches!(init.card, Cardinality::One)
+            && matches!(update_stream.card, Cardinality::One)
+        {
+            Cardinality::One
+        } else {
+            Cardinality::ZeroOrMore
+        };
+
+        match fold_type {
+            FoldType::Reduce => StreamType::new(acc, card),
+            FoldType::Foreach | FoldType::For => StreamType::new(acc, Cardinality::ZeroOrMore),
+        }
+    }
+
+    fn analyze_assignment(
+        &mut self,
+        left: &SpannedFilter,
+        op: &AssignOp,
+        right: &SpannedFilter,
+        input: JType,
+    ) -> StreamType {
+        match op {
+            AssignOp::Assign => {
+                let rhs = self.analyze(right, input.clone());
+                let item = self.write_filter_path(input, left, rhs.item, left.1.clone());
+                StreamType::new(item, rhs.card)
+            }
+            AssignOp::Update => {
+                let old = self.analyze(left, input.clone());
+                let rhs = self.analyze(right, old.item.clone());
+                let item = self.write_filter_path(input, left, rhs.item, left.1.clone());
+                StreamType::new(item, old.card.compose(rhs.card))
+            }
+            AssignOp::UpdateWith(op) => {
+                let old = self.analyze(left, input.clone());
+                let rhs = self.analyze(right, input.clone());
+                let value = math_type(*op, old.item, rhs.item);
+                let item = self.write_filter_path(input, left, value, left.1.clone());
+                StreamType::new(item, old.card.compose(rhs.card))
+            }
         }
     }
 
@@ -492,8 +597,12 @@ impl Analyzer {
                 input.type_names().into_iter().map(JType::string_lit),
             )),
             ("length", []) => StreamType::one(JType::number()),
+            ("tostring", []) => StreamType::one(tostring_type(input)),
+            ("tonumber", []) => StreamType::one(tonumber_type(input)),
+            ("floor", []) => StreamType::one(JType::number()),
+            ("now", []) => StreamType::one(JType::number()),
             ("keys", []) => StreamType::one(self.keys_type(input)),
-            ("not", []) => StreamType::one(JType::bool()),
+            ("not", []) => StreamType::one(not_type(input)),
             ("has", [key]) => StreamType::one(self.has_type(input, key)),
             ("select", [predicate]) => {
                 let refinement = self.analyze_predicate(predicate, input);
@@ -506,6 +615,13 @@ impl Analyzer {
                 }
             }
             ("map", [mapper]) => self.map_call(mapper, input),
+            ("add", []) => StreamType::one(self.add_type(input)),
+            ("join", [separator]) => {
+                let _ = self.analyze(separator, input.clone());
+                StreamType::one(JType::string())
+            }
+            ("transpose", []) => StreamType::one(self.transpose_type(input)),
+            ("ascii_upcase", []) => StreamType::one(ascii_upcase_type(input)),
             ("values", []) => self.filter_values(input),
             ("nulls", []) => self.filter_kind(input, "null"),
             ("booleans", []) => self.filter_kind(input, "boolean"),
@@ -689,6 +805,18 @@ impl Analyzer {
                 let mapped = self.analyze(mapper, *array.items);
                 StreamType::one(JType::array(mapped.item))
             }
+            JType::Object(object) => {
+                let mut values = object
+                    .properties
+                    .values()
+                    .map(|prop| prop.ty.clone())
+                    .collect::<Vec<_>>();
+                if let Some(additional) = object.additional {
+                    values.push(*additional);
+                }
+                let mapped = self.analyze(mapper, JType::union(values));
+                StreamType::one(JType::array(mapped.item))
+            }
             JType::Union(items) => StreamType::one(JType::union(
                 items
                     .into_iter()
@@ -698,12 +826,70 @@ impl Analyzer {
             other => {
                 self.warn_or_error(
                     format!(
-                        "map may be applied to non-array input: {}",
+                        "map may be applied to non-array/non-object input: {}",
                         other.to_compact_string()
                     ),
                     None,
                 );
                 StreamType::one(JType::Unknown)
+            }
+        }
+    }
+
+    fn add_type(&mut self, input: JType) -> JType {
+        match input {
+            JType::Array(array) => {
+                let item = *array.items;
+                if item.is_never() {
+                    JType::Null
+                } else {
+                    JType::union([math_type(MathOp::Add, item.clone(), item), JType::Null])
+                }
+            }
+            JType::Union(items) => JType::union(items.into_iter().map(|item| self.add_type(item))),
+            JType::Unknown => JType::Unknown,
+            other => {
+                self.warn_or_error(
+                    format!(
+                        "add may be applied to non-array input: {}",
+                        other.to_compact_string()
+                    ),
+                    None,
+                );
+                JType::Unknown
+            }
+        }
+    }
+
+    fn transpose_type(&mut self, input: JType) -> JType {
+        match input {
+            JType::Array(array) => match *array.items {
+                JType::Array(inner) => JType::array(JType::array(*inner.items)),
+                JType::Unknown => JType::array(JType::array(JType::Unknown)),
+                other => {
+                    self.warn_or_error(
+                        format!(
+                            "transpose may be applied to non-array items: {}",
+                            other.to_compact_string()
+                        ),
+                        None,
+                    );
+                    JType::array(JType::array(JType::Unknown))
+                }
+            },
+            JType::Union(items) => {
+                JType::union(items.into_iter().map(|item| self.transpose_type(item)))
+            }
+            JType::Unknown => JType::array(JType::array(JType::Unknown)),
+            other => {
+                self.warn_or_error(
+                    format!(
+                        "transpose may be applied to non-array input: {}",
+                        other.to_compact_string()
+                    ),
+                    None,
+                );
+                JType::Unknown
             }
         }
     }
@@ -764,6 +950,7 @@ impl Analyzer {
     ) -> StreamType {
         match input {
             JType::Array(array) => StreamType::one(JType::union([*array.items, JType::Null])),
+            JType::String(_) => StreamType::one(JType::union([JType::string(), JType::Null])),
             JType::Unknown => StreamType::one(JType::Unknown),
             JType::Union(items) => {
                 let mut out = StreamType::zero();
@@ -807,6 +994,7 @@ impl Analyzer {
                 if let Some(additional) = object.additional {
                     values.push(*additional);
                 }
+                values.push(JType::Null);
                 StreamType::one(JType::union(values))
             }
             JType::Unknown => StreamType::one(JType::Unknown),
@@ -905,8 +1093,268 @@ impl Analyzer {
         }
     }
 
-    fn string_type(&mut self, value: &jaq_syn::Str<SpannedFilter>) -> JType {
-        literal_string(value).map_or_else(JType::string, JType::string_lit)
+    fn string_type(&mut self, value: &jaq_syn::Str<SpannedFilter>, input: JType) -> JType {
+        if let Some(literal) = literal_string(value) {
+            return JType::string_lit(literal);
+        }
+        for part in &value.parts {
+            if let string::Part::Fun(filter) = part {
+                let _ = self.analyze(filter, input.clone());
+            }
+        }
+        JType::string()
+    }
+
+    fn write_filter_path(
+        &mut self,
+        input: JType,
+        path_filter: &SpannedFilter,
+        value: JType,
+        span: Span,
+    ) -> JType {
+        match &path_filter.0 {
+            Filter::Id => value,
+            Filter::Path(base, path) if matches!(base.0, Filter::Id) => {
+                self.write_path_parts(input, path, value, span)
+            }
+            _ => {
+                self.warn_or_error(
+                    "assignment left-hand side is not a supported identity-root path",
+                    Some(span),
+                );
+                JType::Unknown
+            }
+        }
+    }
+
+    fn write_path_parts(
+        &mut self,
+        input: JType,
+        path: &[(Part<SpannedFilter>, Opt)],
+        value: JType,
+        span: Span,
+    ) -> JType {
+        let Some((head, rest)) = path.split_first() else {
+            return value;
+        };
+
+        match &head.0 {
+            Part::Index(index) => {
+                if let Some(key) = literal_string_filter(index) {
+                    self.write_field(input, &key, rest, value, index.1.clone())
+                } else if literal_i64_filter(index).is_some() {
+                    self.write_array_index(input, rest, value, index.1.clone())
+                } else {
+                    let key_type = self.analyze(index, input.clone()).item;
+                    self.write_dynamic_index(input, key_type, rest, value, index.1.clone())
+                }
+            }
+            Part::Range(None, None) => self.write_array_index(input, rest, value, span),
+            Part::Range(_, _) => {
+                self.warn_or_error(
+                    "slice assignment is not supported precisely yet",
+                    Some(span),
+                );
+                JType::Unknown
+            }
+        }
+    }
+
+    fn write_field(
+        &mut self,
+        input: JType,
+        key: &str,
+        rest: &[(Part<SpannedFilter>, Opt)],
+        value: JType,
+        span: Span,
+    ) -> JType {
+        match input {
+            JType::Object(mut object) => {
+                let old = object
+                    .properties
+                    .get(key)
+                    .map(|prop| prop.ty.clone())
+                    .or_else(|| {
+                        object
+                            .additional
+                            .as_ref()
+                            .map(|additional| (**additional).clone())
+                    })
+                    .unwrap_or(JType::Unknown);
+                let written = self.write_path_parts(old, rest, value, span);
+                object.properties.insert(
+                    key.to_string(),
+                    Property {
+                        ty: written,
+                        required: true,
+                    },
+                );
+                JType::Object(object)
+            }
+            JType::Null => {
+                let written = self.write_path_parts(JType::Unknown, rest, value, span);
+                let mut properties = BTreeMap::new();
+                properties.insert(
+                    key.to_string(),
+                    Property {
+                        ty: written,
+                        required: true,
+                    },
+                );
+                JType::closed_object(properties)
+            }
+            JType::Unknown => {
+                let written = self.write_path_parts(JType::Unknown, rest, value, span);
+                let mut properties = BTreeMap::new();
+                properties.insert(
+                    key.to_string(),
+                    Property {
+                        ty: written,
+                        required: true,
+                    },
+                );
+                JType::open_object(properties)
+            }
+            JType::Union(items) => JType::union(
+                items
+                    .into_iter()
+                    .map(|item| self.write_field(item, key, rest, value.clone(), span.clone())),
+            ),
+            other => {
+                self.warn_or_error(
+                    format!(
+                        "field assignment may be applied to non-object input: {}",
+                        other.to_compact_string()
+                    ),
+                    Some(span),
+                );
+                JType::Unknown
+            }
+        }
+    }
+
+    fn write_array_index(
+        &mut self,
+        input: JType,
+        rest: &[(Part<SpannedFilter>, Opt)],
+        value: JType,
+        span: Span,
+    ) -> JType {
+        match input {
+            JType::Array(array) => {
+                let written = self.write_path_parts(*array.items, rest, value, span);
+                JType::array(written)
+            }
+            JType::Null => {
+                let written = self.write_path_parts(JType::Unknown, rest, value, span);
+                JType::array(written)
+            }
+            JType::Unknown => {
+                let written = self.write_path_parts(JType::Unknown, rest, value, span);
+                JType::array(written)
+            }
+            JType::Union(items) => JType::union(
+                items
+                    .into_iter()
+                    .map(|item| self.write_array_index(item, rest, value.clone(), span.clone())),
+            ),
+            other => {
+                self.warn_or_error(
+                    format!(
+                        "array assignment may be applied to non-array input: {}",
+                        other.to_compact_string()
+                    ),
+                    Some(span),
+                );
+                JType::Unknown
+            }
+        }
+    }
+
+    fn write_dynamic_index(
+        &mut self,
+        input: JType,
+        key_type: JType,
+        rest: &[(Part<SpannedFilter>, Opt)],
+        value: JType,
+        span: Span,
+    ) -> JType {
+        if !rest.is_empty() {
+            self.warn_or_error(
+                "nested dynamic assignment is not supported precisely yet",
+                Some(span.clone()),
+            );
+            return JType::Unknown;
+        }
+
+        if let Some(keys) = finite_string_literals(&key_type) {
+            let mut out = input;
+            for key in keys {
+                out = self.write_field(out, &key, rest, value.clone(), span.clone());
+            }
+            return out;
+        }
+
+        if is_string_like(&key_type) {
+            return self.write_dynamic_object_key(input, value, span);
+        }
+
+        if is_number_like(&key_type) {
+            return self.write_array_index(input, rest, value, span);
+        }
+
+        match input {
+            JType::Unknown => JType::Unknown,
+            JType::Union(items) => JType::union(items.into_iter().map(|item| {
+                self.write_dynamic_index(item, key_type.clone(), rest, value.clone(), span.clone())
+            })),
+            other => {
+                self.warn_or_error(
+                    format!(
+                        "dynamic assignment key may be non-string/non-number: {}",
+                        key_type.to_compact_string()
+                    ),
+                    Some(span.clone()),
+                );
+                JType::union([
+                    self.write_dynamic_object_key(other, value, span),
+                    JType::Unknown,
+                ])
+            }
+        }
+    }
+
+    fn write_dynamic_object_key(&mut self, input: JType, value: JType, span: Span) -> JType {
+        match input {
+            JType::Object(mut object) => {
+                for prop in object.properties.values_mut() {
+                    prop.ty = JType::union([prop.ty.clone(), value.clone()]);
+                }
+                let additional = object
+                    .additional
+                    .map(|existing| JType::union([*existing, value.clone()]))
+                    .unwrap_or(value);
+                object.additional = Some(Box::new(additional));
+                JType::Object(object)
+            }
+            JType::Null => JType::object(BTreeMap::new(), Some(value)),
+            JType::Unknown => JType::object(BTreeMap::new(), Some(value)),
+            JType::Union(items) => JType::union(
+                items
+                    .into_iter()
+                    .map(|item| self.write_dynamic_object_key(item, value.clone(), span.clone())),
+            ),
+            other => {
+                self.warn_or_error(
+                    format!(
+                        "dynamic object assignment may be applied to non-object input: {}",
+                        other.to_compact_string()
+                    ),
+                    Some(span),
+                );
+                JType::Unknown
+            }
+        }
     }
 
     fn unsupported(
@@ -948,6 +1396,185 @@ fn literal_string(value: &jaq_syn::Str<SpannedFilter>) -> Option<String> {
         }
     }
     Some(out)
+}
+
+fn math_type(op: MathOp, left: JType, right: JType) -> JType {
+    match op {
+        MathOp::Add => plus_type(left, right),
+        MathOp::Sub | MathOp::Mul | MathOp::Div | MathOp::Rem => numeric_math_type(left, right),
+    }
+}
+
+fn numeric_math_type(left: JType, right: JType) -> JType {
+    match (left, right) {
+        (JType::Union(left), right) => JType::union(
+            left.into_iter()
+                .map(|left| numeric_math_type(left, right.clone())),
+        ),
+        (left, JType::Union(right)) => JType::union(
+            right
+                .into_iter()
+                .map(|right| numeric_math_type(left.clone(), right)),
+        ),
+        (JType::Unknown, _) | (_, JType::Unknown) => JType::Unknown,
+        (JType::Number(_), JType::Number(_)) => JType::number(),
+        (JType::Null, JType::Number(_)) | (JType::Number(_), JType::Null) => JType::number(),
+        (JType::Null, JType::Null) => JType::number(),
+        _ => JType::Unknown,
+    }
+}
+
+fn plus_type(left: JType, right: JType) -> JType {
+    match (left, right) {
+        (JType::Union(left), right) => {
+            JType::union(left.into_iter().map(|left| plus_type(left, right.clone())))
+        }
+        (left, JType::Union(right)) => JType::union(
+            right
+                .into_iter()
+                .map(|right| plus_type(left.clone(), right)),
+        ),
+        (JType::Unknown, _) | (_, JType::Unknown) => JType::Unknown,
+        (JType::Null, right) => right,
+        (left, JType::Null) => left,
+        (JType::Number(_), JType::Number(_)) => JType::number(),
+        (JType::String(StringType::Literal(left)), JType::String(StringType::Literal(right))) => {
+            JType::string_lit(format!("{left}{right}"))
+        }
+        (JType::String(_), JType::String(_)) => JType::string(),
+        (JType::Array(left), JType::Array(right)) => {
+            JType::array(JType::union([*left.items, *right.items]))
+        }
+        (JType::Object(left), JType::Object(right)) => JType::Object(merge_objects(left, right)),
+        _ => JType::Unknown,
+    }
+}
+
+fn merge_objects(
+    mut left: crate::types::ObjectType,
+    right: crate::types::ObjectType,
+) -> crate::types::ObjectType {
+    let right_additional = right
+        .additional
+        .as_ref()
+        .map(|additional| (**additional).clone());
+    if let Some(additional) = &right_additional {
+        for prop in left.properties.values_mut() {
+            prop.ty = JType::union([prop.ty.clone(), additional.clone()]);
+        }
+    }
+
+    for (key, prop) in right.properties {
+        left.properties.insert(key, prop);
+    }
+
+    left.additional = match (left.additional, right.additional) {
+        (Some(left), Some(right)) => Some(Box::new(JType::union([*left, *right]))),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    };
+    left
+}
+
+fn alt_type(left: JType, right: JType) -> JType {
+    if matches!(left, JType::Unknown) {
+        return JType::Unknown;
+    }
+    let left_without_falsey = without_null_false(left.clone());
+    if left_without_falsey.is_never() {
+        right
+    } else if left_without_falsey == left {
+        left
+    } else {
+        JType::union([left_without_falsey, right])
+    }
+}
+
+fn without_null_false(input: JType) -> JType {
+    match input {
+        JType::Null => JType::Never,
+        JType::Bool(BoolType::Literal(false)) => JType::Never,
+        JType::Bool(BoolType::Literal(true)) => JType::bool_lit(true),
+        JType::Bool(BoolType::Any) => JType::bool_lit(true),
+        JType::Union(items) => JType::union(items.into_iter().map(without_null_false)),
+        other => other,
+    }
+}
+
+fn tostring_type(input: JType) -> JType {
+    match input {
+        JType::Union(items) => JType::union(items.into_iter().map(tostring_type)),
+        JType::String(string) => JType::String(string),
+        JType::Number(NumberType::Literal(value)) => JType::string_lit(value),
+        JType::Number(NumberType::Any) => JType::string(),
+        JType::Bool(BoolType::Literal(value)) => JType::string_lit(value.to_string()),
+        JType::Bool(BoolType::Any) => {
+            JType::union([JType::string_lit("true"), JType::string_lit("false")])
+        }
+        JType::Null => JType::string_lit("null"),
+        JType::Never => JType::Never,
+        JType::Unknown | JType::Array(_) | JType::Object(_) => JType::string(),
+    }
+}
+
+fn tonumber_type(input: JType) -> JType {
+    match input {
+        JType::Union(items) => JType::union(items.into_iter().map(tonumber_type)),
+        JType::Number(number) => JType::Number(number),
+        JType::String(StringType::Literal(value)) if value.parse::<f64>().is_ok() => {
+            JType::number_lit(value)
+        }
+        JType::String(_) | JType::Unknown => JType::number(),
+        JType::Never => JType::Never,
+        _ => JType::number(),
+    }
+}
+
+fn not_type(input: JType) -> JType {
+    match input.is_truthy_literal() {
+        Some(value) => JType::bool_lit(!value),
+        None => JType::bool(),
+    }
+}
+
+fn ascii_upcase_type(input: JType) -> JType {
+    match input {
+        JType::Union(items) => JType::union(items.into_iter().map(ascii_upcase_type)),
+        JType::String(StringType::Literal(value)) => JType::string_lit(value.to_ascii_uppercase()),
+        JType::Never => JType::Never,
+        _ => JType::string(),
+    }
+}
+
+fn finite_string_literals(input: &JType) -> Option<Vec<String>> {
+    match input {
+        JType::String(StringType::Literal(value)) => Some(vec![value.clone()]),
+        JType::Union(items) => {
+            let mut out = Vec::new();
+            for item in items {
+                out.extend(finite_string_literals(item)?);
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+fn is_string_like(input: &JType) -> bool {
+    match input {
+        JType::String(_) => true,
+        JType::Union(items) => items.iter().all(is_string_like),
+        _ => false,
+    }
+}
+
+fn is_number_like(input: &JType) -> bool {
+    match input {
+        JType::Number(_) => true,
+        JType::Union(items) => items.iter().all(is_number_like),
+        _ => false,
+    }
 }
 
 fn literal_string_filter(filter: &SpannedFilter) -> Option<String> {
@@ -1590,6 +2217,155 @@ mod tests {
 
         let length = check("length", input);
         assert_eq!(length.output.to_compact_string(), "number");
+    }
+
+    #[test]
+    fn variable_binding_preserves_original_dot() {
+        let input = json_schema_to_type(&json!({
+            "type": "object",
+            "properties": {
+                "foo": { "type": "string" },
+                "bar": { "type": "number" }
+            },
+            "required": ["foo", "bar"],
+            "additionalProperties": false
+        }));
+
+        let report = check(".foo as $x | {x: $x, dot: .bar}", input);
+        assert!(report.unsupported_features.is_empty());
+        assert_eq!(
+            report.output.to_compact_string(),
+            "object{dot: number, x: string}"
+        );
+    }
+
+    #[test]
+    fn conversions_and_plus_support_dsl_shapes() {
+        let input = json_schema_to_type(&json!({
+            "type": "object",
+            "properties": {
+                "params": {
+                    "type": "object",
+                    "properties": { "id": { "type": "string" } },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }
+            },
+            "required": ["params"],
+            "additionalProperties": false
+        }));
+
+        let report = check(
+            r#"{ id: (.params.id | tonumber), label: ("Team " + (.params.id | tostring)) }"#,
+            input,
+        );
+        assert!(report.unsupported_features.is_empty());
+        assert_eq!(
+            report.output.to_compact_string(),
+            "object{id: number, label: string}"
+        );
+    }
+
+    #[test]
+    fn assignment_updates_identity_root_paths() {
+        let input = json_schema_to_type(&json!({
+            "type": "object",
+            "properties": {
+                "method": { "type": "string" }
+            },
+            "required": ["method"],
+            "additionalProperties": false
+        }));
+
+        let report = check(".graphqlParams = { id: 1 }", input);
+        assert!(report.unsupported_features.is_empty());
+        assert_eq!(
+            report.output.to_compact_string(),
+            "object{graphqlParams: object{id: 1}, method: string}"
+        );
+    }
+
+    #[test]
+    fn collection_builtins_cover_dsl_transforms() {
+        let report = check("[10, 20, 30] | add", JType::Unknown);
+        assert!(report.unsupported_features.is_empty());
+        assert_eq!(report.output.to_compact_string(), "null | number");
+
+        let input = json_schema_to_type(&json!({
+            "type": "object",
+            "properties": {
+                "keys": {
+                    "type": "array",
+                    "items": { "type": "number" }
+                }
+            },
+            "required": ["keys"],
+            "additionalProperties": false
+        }));
+        let report = check(".keys | map(tostring) | join(\",\")", input);
+        assert!(report.unsupported_features.is_empty());
+        assert_eq!(report.output.to_compact_string(), "string");
+    }
+
+    #[test]
+    fn slices_and_interpolation_are_analyzed() {
+        let input = json_schema_to_type(&json!({
+            "type": "object",
+            "properties": {
+                "body": { "type": "string" },
+                "city": { "type": "string" }
+            },
+            "required": ["body", "city"],
+            "additionalProperties": false
+        }));
+
+        let slice = check(r#".body | .[0:50] + "...""#, input.clone());
+        assert!(slice.unsupported_features.is_empty());
+        assert_eq!(slice.output.to_compact_string(), "string");
+
+        let interpolation = check(r#""Weather for \(.city)""#, input);
+        assert!(interpolation.unsupported_features.is_empty());
+        assert_eq!(interpolation.output.to_compact_string(), "string");
+    }
+
+    #[test]
+    fn reduce_dynamic_update_groups_rows() {
+        let input = json_schema_to_type(&json!({
+            "type": "object",
+            "properties": {
+                "data": {
+                    "type": "object",
+                    "properties": {
+                        "rows": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "team_id": { "type": ["string", "number"] },
+                                    "name": { "type": "string" }
+                                },
+                                "required": ["team_id"],
+                                "additionalProperties": true
+                            }
+                        }
+                    },
+                    "required": ["rows"],
+                    "additionalProperties": false
+                }
+            },
+            "required": ["data"],
+            "additionalProperties": false
+        }));
+
+        let report = check(
+            "reduce .data.rows[] as $row ({}; .[$row.team_id | tostring] += [$row])",
+            input,
+        );
+        assert!(report.unsupported_features.is_empty());
+        let compact = report.output.to_compact_string();
+        assert!(compact.contains("object{}"));
+        assert!(compact.contains("...: array<object"));
+        assert!(compact.contains("team_id: number | string"));
     }
 
     #[test]

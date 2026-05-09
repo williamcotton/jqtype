@@ -180,6 +180,146 @@ describe("analyzer — small cases", () => {
     );
   });
 
+  it("variable binding preserves original dot", () => {
+    const input = jsonSchemaToType({
+      type: "object",
+      properties: {
+        foo: { type: "string" },
+        bar: { type: "number" },
+      },
+      required: ["foo", "bar"],
+      additionalProperties: false,
+    });
+
+    const r = check(".foo as $x | {x: $x, dot: .bar}", input);
+    expect(r.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(r.output)).toBe(
+      "object{dot: number, x: string}",
+    );
+  });
+
+  it("conversions and plus support DSL shapes", () => {
+    const input = jsonSchemaToType({
+      type: "object",
+      properties: {
+        params: {
+          type: "object",
+          properties: { id: { type: "string" } },
+          required: ["id"],
+          additionalProperties: false,
+        },
+      },
+      required: ["params"],
+      additionalProperties: false,
+    });
+
+    const r = check(
+      '{ id: (.params.id | tonumber), label: ("Team " + (.params.id | tostring)) }',
+      input,
+    );
+    expect(r.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(r.output)).toBe(
+      "object{id: number, label: string}",
+    );
+  });
+
+  it("assignment updates identity-root paths", () => {
+    const input = jsonSchemaToType({
+      type: "object",
+      properties: {
+        method: { type: "string" },
+      },
+      required: ["method"],
+      additionalProperties: false,
+    });
+
+    const r = check(".graphqlParams = { id: 1 }", input);
+    expect(r.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(r.output)).toBe(
+      "object{graphqlParams: object{id: 1}, method: string}",
+    );
+  });
+
+  it("collection builtins cover DSL transforms", () => {
+    const add = check("[10, 20, 30] | add", "Unknown");
+    expect(add.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(add.output)).toBe("null | number");
+
+    const input = jsonSchemaToType({
+      type: "object",
+      properties: {
+        keys: {
+          type: "array",
+          items: { type: "number" },
+        },
+      },
+      required: ["keys"],
+      additionalProperties: false,
+    });
+    const joined = check('.keys | map(tostring) | join(",")', input);
+    expect(joined.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(joined.output)).toBe("string");
+  });
+
+  it("slices and interpolation are analyzed", () => {
+    const input = jsonSchemaToType({
+      type: "object",
+      properties: {
+        body: { type: "string" },
+        city: { type: "string" },
+      },
+      required: ["body", "city"],
+      additionalProperties: false,
+    });
+
+    const slice = check('.body | .[0:50] + "..."', input);
+    expect(slice.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(slice.output)).toBe("string");
+
+    const interpolation = check('"Weather for \\(.city)"', input);
+    expect(interpolation.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(interpolation.output)).toBe("string");
+  });
+
+  it("reduce dynamic update groups rows", () => {
+    const input = jsonSchemaToType({
+      type: "object",
+      properties: {
+        data: {
+          type: "object",
+          properties: {
+            rows: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  team_id: { type: ["string", "number"] },
+                  name: { type: "string" },
+                },
+                required: ["team_id"],
+                additionalProperties: true,
+              },
+            },
+          },
+          required: ["rows"],
+          additionalProperties: false,
+        },
+      },
+      required: ["data"],
+      additionalProperties: false,
+    });
+
+    const r = check(
+      "reduce .data.rows[] as $row ({}; .[$row.team_id | tostring] += [$row])",
+      input,
+    );
+    expect(r.unsupported_features).toHaveLength(0);
+    const compact = StreamType.toCompactString(r.output);
+    expect(compact).toContain("object{}");
+    expect(compact).toContain("...: array<object");
+    expect(compact).toContain("team_id: number | string");
+  });
+
   it("unsupported builtin produces a warning", () => {
     const r = check("group_by(.name)", JType.array("Unknown"));
     expect(StreamType.toCompactString(r.output)).toBe("unknown");

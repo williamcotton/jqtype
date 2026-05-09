@@ -14,14 +14,17 @@ import {
 import {
   parseFilter,
   type ExpressionAst,
+  type ForeachAst,
   type IfAst,
   type IndexAst,
   type IteratorAst,
   type ObjectEntryAst,
   type ProgAst,
+  type ReduceAst,
   type SliceAst,
   type StrAst,
   type TryAst,
+  type VarDeclarationAst,
 } from "./parser.js";
 
 export type AnalysisMode = "Permissive" | "Strict";
@@ -168,6 +171,7 @@ class Analyzer {
   options: AnalyzeOptions;
   diagnostics: Diagnostic[] = [];
   unsupportedFeatures: UnsupportedFeature[] = [];
+  env = new Map<string, JTypeT>();
 
   constructor(options: AnalyzeOptions) {
     this.options = options;
@@ -185,7 +189,7 @@ class Analyzer {
       case "num":
         return StreamType.one(JType.numberLit(numberLiteral(expr.value)));
       case "str":
-        return StreamType.one(this.stringType(expr));
+        return StreamType.one(this.stringType(expr, input));
       case "bool":
         return StreamType.one(JType.boolLit(expr.value));
       case "null":
@@ -212,18 +216,18 @@ class Analyzer {
       case "unary":
         return this.analyzeUnary(expr, input);
       case "var":
-        return this.unsupported(
-          `variables are not supported yet: $${expr.name}`,
-          input === "Unknown" ? "Unknown" : "Unknown",
-        );
+        {
+          const name = normalizeVarName(expr.name);
+          const bound = this.env.get(name);
+          if (bound !== undefined) return StreamType.one(bound);
+          return this.unsupported(`variables are not supported yet: $${name}`, "Unknown");
+        }
       case "varDeclaration":
-        return this.unsupported(
-          "variable bindings (`as`) are not supported yet",
-          input,
-        );
+        return this.analyzeVarDeclaration(expr, input);
       case "reduce":
+        return this.analyzeReduce(expr, input);
       case "foreach":
-        return this.unsupported("fold filters are not supported yet", input);
+        return this.analyzeForeach(expr, input);
       case "recursiveDescent":
         return this.unsupported(
           "recursive descent is not supported yet",
@@ -275,6 +279,96 @@ class Analyzer {
     }
 
     return StreamType.one(JType.object(properties, additional));
+  }
+
+  withVar<T>(name: string, ty: JTypeT, f: () => T): T {
+    const key = normalizeVarName(name);
+    const hadPrevious = this.env.has(key);
+    const previous = this.env.get(key);
+    this.env.set(key, ty);
+    const out = f();
+    if (hadPrevious) this.env.set(key, previous!);
+    else this.env.delete(key);
+    return out;
+  }
+
+  analyzeVarDeclaration(node: VarDeclarationAst, input: JTypeT): StreamType {
+    const bound = this.analyze(node.expr, input);
+    if (bound.card === "Zero") return StreamType.zero();
+
+    let perItem: StreamType | null = null;
+    for (const item of flattenUnion(bound.item)) {
+      const branch = this.withSimpleDestructuring(node.destructuring, item, () =>
+        this.analyze(node.next, input),
+      );
+      perItem = perItem === null ? branch : StreamType.joinAlternative(perItem, branch);
+    }
+    const composed = perItem ?? StreamType.zero();
+    return StreamType.new(composed.item, Cardinality.compose(bound.card, composed.card));
+  }
+
+  withSimpleDestructuring<T>(
+    destructuring: VarDeclarationAst["destructuring"],
+    ty: JTypeT,
+    f: () => T,
+  ): T {
+    if (destructuring.length === 1 && destructuring[0]!.type === "var") {
+      return this.withVar(destructuring[0]!.name, ty, f);
+    }
+    this.warnOrError("destructuring variable bindings are not supported precisely yet");
+    return f();
+  }
+
+  analyzeReduce(node: ReduceAst, input: JTypeT): StreamType {
+    return this.analyzeFold(node.expr, node.var, node.init, node.update, undefined, input, false);
+  }
+
+  analyzeForeach(node: ForeachAst, input: JTypeT): StreamType {
+    return this.analyzeFold(node.expr, node.var, node.init, node.update, node.extract, input, true);
+  }
+
+  analyzeFold(
+    expr: ExpressionAst,
+    varName: string,
+    initExpr: ExpressionAst,
+    updateExpr: ExpressionAst,
+    extractExpr: ExpressionAst | undefined,
+    input: JTypeT,
+    emitsIntermediate: boolean,
+  ): StreamType {
+    const xs = this.analyze(expr, input);
+    const init = this.analyze(initExpr, input);
+    if (xs.card === "Zero") return init;
+
+    let acc = init.item;
+    let update: StreamType = StreamType.one(acc);
+    for (let i = 0; i < 8; i += 1) {
+      let perItem: StreamType | null = null;
+      for (const item of flattenUnion(xs.item)) {
+        const branch = this.withVar(varName, item, () => this.analyze(updateExpr, acc));
+        perItem = perItem === null ? branch : StreamType.joinAlternative(perItem, branch);
+      }
+      update = perItem ?? StreamType.zero();
+      const next = JType.union([acc, update.item]);
+      if (JType.toCompactString(next) === JType.toCompactString(acc)) break;
+      acc = next;
+    }
+
+    if (emitsIntermediate) {
+      if (extractExpr !== undefined) {
+        let extracted: StreamType | null = null;
+        for (const item of flattenUnion(xs.item)) {
+          const branch = this.withVar(varName, item, () => this.analyze(extractExpr, acc));
+          extracted = extracted === null ? branch : StreamType.joinAlternative(extracted, branch);
+        }
+        const out = extracted ?? StreamType.zero();
+        return StreamType.new(out.item, Cardinality.compose(xs.card, out.card));
+      }
+      return StreamType.new(acc, "ZeroOrMore");
+    }
+
+    const card = init.card === "One" && update.card === "One" ? "One" : "ZeroOrMore";
+    return StreamType.new(acc, card);
   }
 
   analyzeIndex(
@@ -360,6 +454,9 @@ class Analyzer {
       if ("Array" in input) {
         return StreamType.one(JType.union([input.Array.items, "Null"]));
       }
+      if ("String" in input) {
+        return StreamType.one(JType.union([JType.string(), "Null"]));
+      }
       if ("Union" in input) {
         let out = StreamType.zero();
         for (const item of input.Union) {
@@ -392,6 +489,7 @@ class Analyzer {
           (p) => p.ty,
         );
         if (input.Object.additional !== null) values.push(input.Object.additional);
+        values.push("Null");
         return StreamType.one(JType.union(values));
       }
       if ("Union" in input) {
@@ -494,17 +592,65 @@ class Analyzer {
     }
     if (op === "or" || op === "and") return StreamType.one(JType.bool());
     if (op === "+" || op === "-" || op === "*" || op === "/" || op === "%") {
-      this.analyze(node.left, input);
-      this.analyze(node.right, input);
-      return StreamType.one("Unknown");
+      const left = this.analyze(node.left, input);
+      const right = this.analyze(node.right, input);
+      return StreamType.new(
+        mathType(op, left.item, right.item),
+        Cardinality.compose(left.card, right.card),
+      );
     }
     if (op === "//") {
       const left = this.analyze(node.left, input);
-      return StreamType.join(left, this.analyze(node.right, input));
+      const right = this.analyze(node.right, input);
+      return StreamType.new(
+        altType(left.item, right.item),
+        Cardinality.alternative(left.card, right.card),
+      );
     }
-    return this.unsupported(
-      `assignment operator \`${op}\` is not supported yet`,
-      input,
+    if (
+      op === "=" ||
+      op === "|=" ||
+      op === "+=" ||
+      op === "-=" ||
+      op === "*=" ||
+      op === "/=" ||
+      op === "%=" ||
+      op === "//="
+    ) {
+      return this.analyzeAssignment(node.left, op, node.right, input);
+    }
+    return this.unsupported(`unsupported binary operator \`${op}\``, "Unknown");
+  }
+
+  analyzeAssignment(
+    leftExpr: ExpressionAst,
+    op: string,
+    rightExpr: ExpressionAst,
+    input: JTypeT,
+  ): StreamType {
+    if (op === "=") {
+      const rhs = this.analyze(rightExpr, input);
+      return StreamType.new(this.writeFilterPath(input, leftExpr, rhs.item), rhs.card);
+    }
+    if (op === "|=") {
+      const old = this.analyze(leftExpr, input);
+      const rhs = this.analyze(rightExpr, old.item);
+      return StreamType.new(
+        this.writeFilterPath(input, leftExpr, rhs.item),
+        Cardinality.compose(old.card, rhs.card),
+      );
+    }
+
+    const old = this.analyze(leftExpr, input);
+    const rhs = this.analyze(rightExpr, input);
+    const mathOp = op.slice(0, -1);
+    const value =
+      mathOp === "//"
+        ? altType(old.item, rhs.item)
+        : mathType(mathOp, old.item, rhs.item);
+    return StreamType.new(
+      this.writeFilterPath(input, leftExpr, value),
+      Cardinality.compose(old.card, rhs.card),
     );
   }
 
@@ -569,8 +715,12 @@ class Analyzer {
       );
     }
     if (name === "length" && args.length === 0) return StreamType.one(JType.number());
+    if (name === "tostring" && args.length === 0) return StreamType.one(tostringType(input));
+    if (name === "tonumber" && args.length === 0) return StreamType.one(tonumberType(input));
+    if (name === "floor" && args.length === 0) return StreamType.one(JType.number());
+    if (name === "now" && args.length === 0) return StreamType.one(JType.number());
     if (name === "keys" && args.length === 0) return StreamType.one(this.keysType(input));
-    if (name === "not" && args.length === 0) return StreamType.one(JType.bool());
+    if (name === "not" && args.length === 0) return StreamType.one(notType(input));
     if (name === "has" && args.length === 1) {
       return StreamType.one(this.hasType(input, args[0]!));
     }
@@ -582,6 +732,17 @@ class Analyzer {
     }
     if (name === "map" && args.length === 1) {
       return this.mapCall(args[0]!, input);
+    }
+    if (name === "add" && args.length === 0) return StreamType.one(this.addType(input));
+    if (name === "join" && args.length === 1) {
+      this.analyze(args[0]!, input);
+      return StreamType.one(JType.string());
+    }
+    if (name === "transpose" && args.length === 0) {
+      return StreamType.one(this.transposeType(input));
+    }
+    if (name === "ascii_upcase" && args.length === 0) {
+      return StreamType.one(asciiUpcaseType(input));
     }
     if (name === "values" && args.length === 0) return this.filterValues(input);
     if (name === "nulls" && args.length === 0) return this.filterKind(input, "null");
@@ -679,6 +840,14 @@ class Analyzer {
         const mapped = this.analyze(mapper, input.Array.items);
         return StreamType.one(JType.array(mapped.item));
       }
+      if ("Object" in input) {
+        const values: JTypeT[] = Object.values(input.Object.properties).map(
+          (p) => p.ty,
+        );
+        if (input.Object.additional !== null) values.push(input.Object.additional);
+        const mapped = this.analyze(mapper, JType.union(values));
+        return StreamType.one(JType.array(mapped.item));
+      }
       if ("Union" in input) {
         return StreamType.one(
           JType.union(input.Union.map((item) => this.mapCall(mapper, item).item)),
@@ -687,9 +856,49 @@ class Analyzer {
     }
     if (input === "Unknown") return StreamType.one(JType.array("Unknown"));
     this.warnOrError(
-      `map may be applied to non-array input: ${JType.toCompactString(input)}`,
+      `map may be applied to non-array/non-object input: ${JType.toCompactString(input)}`,
     );
     return StreamType.one("Unknown");
+  }
+
+  addType(input: JTypeT): JTypeT {
+    if (typeof input === "object") {
+      if ("Array" in input) {
+        const item = input.Array.items;
+        if (item === "Never") return "Null";
+        return JType.union([mathType("+", item, item), "Null"]);
+      }
+      if ("Union" in input) return JType.union(input.Union.map((item) => this.addType(item)));
+    }
+    if (input === "Unknown") return "Unknown";
+    this.warnOrError(
+      `add may be applied to non-array input: ${JType.toCompactString(input)}`,
+    );
+    return "Unknown";
+  }
+
+  transposeType(input: JTypeT): JTypeT {
+    if (typeof input === "object") {
+      if ("Array" in input) {
+        const item = input.Array.items;
+        if (typeof item === "object" && "Array" in item) {
+          return JType.array(JType.array(item.Array.items));
+        }
+        if (item === "Unknown") return JType.array(JType.array("Unknown"));
+        this.warnOrError(
+          `transpose may be applied to non-array items: ${JType.toCompactString(item)}`,
+        );
+        return JType.array(JType.array("Unknown"));
+      }
+      if ("Union" in input) {
+        return JType.union(input.Union.map((item) => this.transposeType(item)));
+      }
+    }
+    if (input === "Unknown") return JType.array(JType.array("Unknown"));
+    this.warnOrError(
+      `transpose may be applied to non-array input: ${JType.toCompactString(input)}`,
+    );
+    return "Unknown";
   }
 
   filterValues(input: JTypeT): StreamType {
@@ -705,9 +914,138 @@ class Analyzer {
     return StreamType.zeroOrOne(matching);
   }
 
-  stringType(value: StrAst): JTypeT {
+  stringType(value: StrAst, input: JTypeT): JTypeT {
     const lit = literalString(value);
-    return lit === null ? JType.string() : JType.stringLit(lit);
+    if (lit !== null) return JType.stringLit(lit);
+    if (value.interpolated === true) {
+      for (const part of value.parts) {
+        if (typeof part !== "string") this.analyze(part, input);
+      }
+    }
+    return JType.string();
+  }
+
+  writeFilterPath(input: JTypeT, target: ExpressionAst, value: JTypeT): JTypeT {
+    switch (target.type) {
+      case "identity":
+        return value;
+      case "index": {
+        const base = this.analyze(target.expr, input).item;
+        const updated = this.writeIndex(base, target.index, value);
+        return this.writeFilterPath(input, target.expr, updated);
+      }
+      case "iterator": {
+        const base = this.analyze(target.expr, input).item;
+        const updated = this.writeArrayIndex(base, value);
+        return this.writeFilterPath(input, target.expr, updated);
+      }
+      default:
+        this.warnOrError("assignment left-hand side is not a supported identity-root path");
+        return "Unknown";
+    }
+  }
+
+  writeIndex(
+    input: JTypeT,
+    index: string | ExpressionAst,
+    value: JTypeT,
+  ): JTypeT {
+    if (typeof index === "string") return this.writeField(input, index, value);
+    if (index.type === "num") return this.writeArrayIndex(input, value);
+    if (index.type === "str" && index.interpolated === false) {
+      return this.writeField(input, index.value, value);
+    }
+    const keyType = this.analyze(index, input).item;
+    return this.writeDynamicIndex(input, keyType, value);
+  }
+
+  writeField(input: JTypeT, key: string, value: JTypeT): JTypeT {
+    if (typeof input === "object") {
+      if ("Object" in input) {
+        return JType.object(
+          {
+            ...input.Object.properties,
+            [key]: { ty: value, required: true },
+          },
+          input.Object.additional,
+        );
+      }
+      if ("Union" in input) {
+        return JType.union(input.Union.map((item) => this.writeField(item, key, value)));
+      }
+    }
+    if (input === "Null") {
+      return JType.closedObject({ [key]: { ty: value, required: true } });
+    }
+    if (input === "Unknown") {
+      return JType.openObject({ [key]: { ty: value, required: true } });
+    }
+    this.warnOrError(
+      `field assignment may be applied to non-object input: ${JType.toCompactString(input)}`,
+    );
+    return "Unknown";
+  }
+
+  writeArrayIndex(input: JTypeT, value: JTypeT): JTypeT {
+    if (typeof input === "object") {
+      if ("Array" in input) return JType.array(value);
+      if ("Union" in input) {
+        return JType.union(input.Union.map((item) => this.writeArrayIndex(item, value)));
+      }
+    }
+    if (input === "Null" || input === "Unknown") return JType.array(value);
+    this.warnOrError(
+      `array assignment may be applied to non-array input: ${JType.toCompactString(input)}`,
+    );
+    return "Unknown";
+  }
+
+  writeDynamicIndex(input: JTypeT, keyType: JTypeT, value: JTypeT): JTypeT {
+    const keys = finiteStringLiterals(keyType);
+    if (keys !== null) {
+      let out = input;
+      for (const key of keys) out = this.writeField(out, key, value);
+      return out;
+    }
+    if (isStringLike(keyType)) return this.writeDynamicObjectKey(input, value);
+    if (isNumberLike(keyType)) return this.writeArrayIndex(input, value);
+
+    if (typeof input === "object" && "Union" in input) {
+      return JType.union(
+        input.Union.map((item) => this.writeDynamicIndex(item, keyType, value)),
+      );
+    }
+    if (input === "Unknown") return "Unknown";
+    this.warnOrError(
+      `dynamic assignment key may be non-string/non-number: ${JType.toCompactString(keyType)}`,
+    );
+    return JType.union([this.writeDynamicObjectKey(input, value), "Unknown"]);
+  }
+
+  writeDynamicObjectKey(input: JTypeT, value: JTypeT): JTypeT {
+    if (typeof input === "object") {
+      if ("Object" in input) {
+        const props: Record<string, Property> = {};
+        for (const [key, prop] of Object.entries(input.Object.properties)) {
+          props[key] = { ...prop, ty: JType.union([prop.ty, value]) };
+        }
+        const additional =
+          input.Object.additional === null
+            ? value
+            : JType.union([input.Object.additional, value]);
+        return JType.object(props, additional);
+      }
+      if ("Union" in input) {
+        return JType.union(
+          input.Union.map((item) => this.writeDynamicObjectKey(item, value)),
+        );
+      }
+    }
+    if (input === "Null" || input === "Unknown") return JType.object({}, value);
+    this.warnOrError(
+      `dynamic object assignment may be applied to non-object input: ${JType.toCompactString(input)}`,
+    );
+    return "Unknown";
   }
 
   unsupported(feature: string, fallback: JTypeT): StreamType {
@@ -736,6 +1074,207 @@ function literalString(value: StrAst): string | null {
     else return null;
   }
   return out;
+}
+
+function mathType(op: string, left: JTypeT, right: JTypeT): JTypeT {
+  if (op === "+") return plusType(left, right);
+  return numericMathType(left, right);
+}
+
+function numericMathType(left: JTypeT, right: JTypeT): JTypeT {
+  if (typeof left === "object" && "Union" in left) {
+    return JType.union(left.Union.map((item) => numericMathType(item, right)));
+  }
+  if (typeof right === "object" && "Union" in right) {
+    return JType.union(right.Union.map((item) => numericMathType(left, item)));
+  }
+  if (left === "Unknown" || right === "Unknown") return "Unknown";
+  if (left === "Null" && right === "Null") return JType.number();
+  if (left === "Null" && typeof right === "object" && "Number" in right) return JType.number();
+  if (right === "Null" && typeof left === "object" && "Number" in left) return JType.number();
+  if (
+    typeof left === "object" &&
+    "Number" in left &&
+    typeof right === "object" &&
+    "Number" in right
+  ) {
+    return JType.number();
+  }
+  return "Unknown";
+}
+
+function plusType(left: JTypeT, right: JTypeT): JTypeT {
+  if (typeof left === "object" && "Union" in left) {
+    return JType.union(left.Union.map((item) => plusType(item, right)));
+  }
+  if (typeof right === "object" && "Union" in right) {
+    return JType.union(right.Union.map((item) => plusType(left, item)));
+  }
+  if (left === "Unknown" || right === "Unknown") return "Unknown";
+  if (left === "Null") return right;
+  if (right === "Null") return left;
+  if (
+    typeof left === "object" &&
+    "Number" in left &&
+    typeof right === "object" &&
+    "Number" in right
+  ) {
+    return JType.number();
+  }
+  if (
+    typeof left === "object" &&
+    "String" in left &&
+    typeof right === "object" &&
+    "String" in right
+  ) {
+    if (left.String !== "Any" && right.String !== "Any") {
+      return JType.stringLit(`${left.String.Literal}${right.String.Literal}`);
+    }
+    return JType.string();
+  }
+  if (
+    typeof left === "object" &&
+    "Array" in left &&
+    typeof right === "object" &&
+    "Array" in right
+  ) {
+    return JType.array(JType.union([left.Array.items, right.Array.items]));
+  }
+  if (
+    typeof left === "object" &&
+    "Object" in left &&
+    typeof right === "object" &&
+    "Object" in right
+  ) {
+    return JType.object(
+      mergeObjectProperties(left.Object, right.Object),
+      mergeAdditional(left.Object.additional, right.Object.additional),
+    );
+  }
+  return "Unknown";
+}
+
+function mergeObjectProperties(left: ObjectType, right: ObjectType): Record<string, Property> {
+  const props: Record<string, Property> = {};
+  for (const [key, prop] of Object.entries(left.properties)) {
+    props[key] =
+      right.additional === null ? { ...prop } : { ...prop, ty: JType.union([prop.ty, right.additional]) };
+  }
+  for (const [key, prop] of Object.entries(right.properties)) {
+    props[key] = { ...prop };
+  }
+  return props;
+}
+
+function mergeAdditional(left: JTypeT | null, right: JTypeT | null): JTypeT | null {
+  if (left !== null && right !== null) return JType.union([left, right]);
+  return left ?? right;
+}
+
+function altType(left: JTypeT, right: JTypeT): JTypeT {
+  if (left === "Unknown") return "Unknown";
+  const kept = withoutNullFalse(left);
+  if (kept === "Never") return right;
+  if (JType.toCompactString(kept) === JType.toCompactString(left)) return left;
+  return JType.union([kept, right]);
+}
+
+function withoutNullFalse(input: JTypeT): JTypeT {
+  if (input === "Null") return "Never";
+  if (typeof input === "object") {
+    if ("Bool" in input) {
+      if (input.Bool === "Any") return JType.boolLit(true);
+      return input.Bool.Literal ? JType.boolLit(true) : "Never";
+    }
+    if ("Union" in input) return JType.union(input.Union.map(withoutNullFalse));
+  }
+  return input;
+}
+
+function tostringType(input: JTypeT): JTypeT {
+  if (typeof input === "object") {
+    if ("Union" in input) return JType.union(input.Union.map(tostringType));
+    if ("String" in input) return input;
+    if ("Number" in input) {
+      return input.Number === "Any" ? JType.string() : JType.stringLit(input.Number.Literal);
+    }
+    if ("Bool" in input) {
+      if (input.Bool === "Any") {
+        return JType.union([JType.stringLit("true"), JType.stringLit("false")]);
+      }
+      return JType.stringLit(String(input.Bool.Literal));
+    }
+  }
+  if (input === "Null") return JType.stringLit("null");
+  if (input === "Never") return "Never";
+  return JType.string();
+}
+
+function tonumberType(input: JTypeT): JTypeT {
+  if (typeof input === "object") {
+    if ("Union" in input) return JType.union(input.Union.map(tonumberType));
+    if ("Number" in input) return input;
+    if ("String" in input) {
+      if (input.String !== "Any" && Number.isFinite(Number(input.String.Literal))) {
+        return JType.numberLit(input.String.Literal);
+      }
+      return JType.number();
+    }
+  }
+  if (input === "Never") return "Never";
+  return JType.number();
+}
+
+function notType(input: JTypeT): JTypeT {
+  const truthy = JType.isTruthyLiteral(input);
+  return truthy === null ? JType.bool() : JType.boolLit(!truthy);
+}
+
+function asciiUpcaseType(input: JTypeT): JTypeT {
+  if (typeof input === "object") {
+    if ("Union" in input) return JType.union(input.Union.map(asciiUpcaseType));
+    if ("String" in input && input.String !== "Any") {
+      return JType.stringLit(input.String.Literal.toUpperCase());
+    }
+  }
+  if (input === "Never") return "Never";
+  return JType.string();
+}
+
+function finiteStringLiterals(input: JTypeT): string[] | null {
+  if (typeof input === "object") {
+    if ("String" in input && input.String !== "Any") return [input.String.Literal];
+    if ("Union" in input) {
+      const out: string[] = [];
+      for (const item of input.Union) {
+        const literals = finiteStringLiterals(item);
+        if (literals === null) return null;
+        out.push(...literals);
+      }
+      return out;
+    }
+  }
+  return null;
+}
+
+function isStringLike(input: JTypeT): boolean {
+  if (typeof input === "object") {
+    if ("String" in input) return true;
+    if ("Union" in input) return input.Union.every(isStringLike);
+  }
+  return false;
+}
+
+function isNumberLike(input: JTypeT): boolean {
+  if (typeof input === "object") {
+    if ("Number" in input) return true;
+    if ("Union" in input) return input.Union.every(isNumberLike);
+  }
+  return false;
+}
+
+function normalizeVarName(name: string): string {
+  return name.startsWith("$") ? name.slice(1) : name;
 }
 
 function literalStringFilter(expr: ExpressionAst): string | null {

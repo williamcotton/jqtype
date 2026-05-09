@@ -251,6 +251,7 @@ class Analyzer {
   diagnostics: Diagnostic[] = [];
   unsupportedFeatures: UnsupportedFeature[] = [];
   env = new Map<string, JTypeT>();
+  missingPathNull = false;
 
   constructor(options: ResolvedAnalyzeOptions, source: string) {
     this.options = options;
@@ -382,6 +383,14 @@ class Analyzer {
     return out;
   }
 
+  withFreshMissingPathScope<T>(f: () => T): T {
+    const previous = this.missingPathNull;
+    this.missingPathNull = false;
+    const out = f();
+    this.missingPathNull = previous;
+    return out;
+  }
+
   analyzeVarDeclaration(node: VarDeclarationAst, input: JTypeT): StreamType {
     const bound = this.analyze(node.expr, input);
     if (bound.card === "Zero") return StreamType.zero();
@@ -507,12 +516,23 @@ class Analyzer {
       if ("Object" in input) {
         const prop = input.Object.properties[key];
         if (prop) {
+          this.missingPathNull = false;
           return StreamType.one(
             prop.required ? prop.ty : JType.union([prop.ty, "Null"]),
           );
         }
         if (input.Object.additional !== null) {
+          this.missingPathNull = false;
           return StreamType.one(JType.union([input.Object.additional, "Null"]));
+        }
+        if (optional) {
+          this.missingPathNull = false;
+        } else {
+          this.missingPathNull = true;
+          this.warnOrError(
+            `property "${key}" is not present on ${JType.toCompactString(input)}`,
+            this.spanForProperty(key),
+          );
         }
         return StreamType.one("Null");
       }
@@ -525,14 +545,19 @@ class Analyzer {
       }
     }
     if (input === "Null") return StreamType.one("Null");
-    if (input === "Unknown") return StreamType.one("Unknown");
+    if (input === "Unknown") {
+      this.missingPathNull = false;
+      return StreamType.one("Unknown");
+    }
 
     if (optional) {
+      this.missingPathNull = false;
       this.warnOrError(
         `optional field \`${key}\` skipped non-object input: ${JType.toCompactString(input)}`,
       );
       return StreamType.zero();
     }
+    this.missingPathNull = false;
     this.warnOrError(
       `field \`${key}\` may be applied to non-object input: ${JType.toCompactString(input)}`,
     );
@@ -542,9 +567,11 @@ class Analyzer {
   accessIndex(input: JTypeT, optional: boolean): StreamType {
     if (typeof input === "object") {
       if ("Array" in input) {
+        this.missingPathNull = false;
         return StreamType.one(JType.union([input.Array.items, "Null"]));
       }
       if ("String" in input) {
+        this.missingPathNull = false;
         return StreamType.one(JType.union([JType.string(), "Null"]));
       }
       if ("Union" in input) {
@@ -555,7 +582,14 @@ class Analyzer {
         return out;
       }
     }
-    if (input === "Unknown") return StreamType.one("Unknown");
+    if (input === "Null" && this.missingPathNull) {
+      this.missingPathNull = false;
+      return StreamType.one("Unknown");
+    }
+    if (input === "Unknown") {
+      this.missingPathNull = false;
+      return StreamType.one("Unknown");
+    }
 
     if (optional) {
       this.warnOrError(
@@ -572,9 +606,11 @@ class Analyzer {
   accessDynamicIndex(input: JTypeT, optional: boolean): StreamType {
     if (typeof input === "object") {
       if ("Array" in input) {
+        this.missingPathNull = false;
         return StreamType.one(JType.union([input.Array.items, "Null"]));
       }
       if ("Object" in input) {
+        this.missingPathNull = false;
         const values: JTypeT[] = Object.values(input.Object.properties).map(
           (p) => p.ty,
         );
@@ -590,7 +626,14 @@ class Analyzer {
         return out;
       }
     }
-    if (input === "Unknown") return StreamType.one("Unknown");
+    if (input === "Null" && this.missingPathNull) {
+      this.missingPathNull = false;
+      return StreamType.one("Unknown");
+    }
+    if (input === "Unknown") {
+      this.missingPathNull = false;
+      return StreamType.one("Unknown");
+    }
 
     if (optional) {
       this.warnOrError(
@@ -607,9 +650,11 @@ class Analyzer {
   iterate(input: JTypeT, optional: boolean): StreamType {
     if (typeof input === "object") {
       if ("Array" in input) {
+        this.missingPathNull = false;
         return StreamType.zeroOrMore(input.Array.items);
       }
       if ("Object" in input) {
+        this.missingPathNull = false;
         const values: JTypeT[] = Object.values(input.Object.properties).map(
           (p) => p.ty,
         );
@@ -624,7 +669,14 @@ class Analyzer {
         return out;
       }
     }
-    if (input === "Unknown") return StreamType.zeroOrMore("Unknown");
+    if (input === "Null" && this.missingPathNull) {
+      this.missingPathNull = false;
+      return StreamType.zeroOrMore("Unknown");
+    }
+    if (input === "Unknown") {
+      this.missingPathNull = false;
+      return StreamType.zeroOrMore("Unknown");
+    }
 
     if (optional) {
       this.warnOrError(
@@ -640,15 +692,28 @@ class Analyzer {
 
   slice(input: JTypeT): StreamType {
     if (typeof input === "object") {
-      if ("Array" in input) return StreamType.one(JType.array(input.Array.items));
-      if ("String" in input) return StreamType.one(JType.string());
+      if ("Array" in input) {
+        this.missingPathNull = false;
+        return StreamType.one(JType.array(input.Array.items));
+      }
+      if ("String" in input) {
+        this.missingPathNull = false;
+        return StreamType.one(JType.string());
+      }
       if ("Union" in input) {
         return StreamType.one(
           JType.union(input.Union.map((item) => this.slice(item).item)),
         );
       }
     }
-    if (input === "Unknown") return StreamType.one("Unknown");
+    if (input === "Null" && this.missingPathNull) {
+      this.missingPathNull = false;
+      return StreamType.one("Unknown");
+    }
+    if (input === "Unknown") {
+      this.missingPathNull = false;
+      return StreamType.one("Unknown");
+    }
     this.warnOrError(
       `slice may be applied to non-array/non-string input: ${JType.toCompactString(input)}`,
     );
@@ -912,18 +977,27 @@ class Analyzer {
   keysType(input: JTypeT): JTypeT {
     if (typeof input === "object") {
       if ("Object" in input) {
+        this.missingPathNull = false;
         const keys: JTypeT[] = Object.keys(input.Object.properties).map((k) =>
           JType.stringLit(k),
         );
         if (input.Object.additional !== null) keys.push(JType.string());
         return JType.array(JType.union(keys));
       }
-      if ("Array" in input) return JType.array(JType.number());
+      if ("Array" in input) {
+        this.missingPathNull = false;
+        return JType.array(JType.number());
+      }
       if ("Union" in input) {
         return JType.union(input.Union.map((item) => this.keysType(item)));
       }
     }
+    if (input === "Null" && this.missingPathNull) {
+      this.missingPathNull = false;
+      return "Unknown";
+    }
     if (input === "Unknown") {
+      this.missingPathNull = false;
       return JType.array(JType.union([JType.string(), JType.number()]));
     }
     this.warnOrError(
@@ -935,7 +1009,10 @@ class Analyzer {
   mapCall(mapper: ExpressionAst, input: JTypeT): StreamType {
     if (typeof input === "object") {
       if ("Array" in input) {
-        const mapped = this.analyze(mapper, input.Array.items);
+        const mapped = this.withFreshMissingPathScope(() =>
+          this.analyze(mapper, input.Array.items),
+        );
+        this.missingPathNull = false;
         return StreamType.one(JType.array(mapped.item));
       }
       if ("Object" in input) {
@@ -943,16 +1020,29 @@ class Analyzer {
           (p) => p.ty,
         );
         if (input.Object.additional !== null) values.push(input.Object.additional);
-        const mapped = this.analyze(mapper, JType.union(values));
+        const mapped = this.withFreshMissingPathScope(() =>
+          this.analyze(mapper, JType.union(values)),
+        );
+        this.missingPathNull = false;
         return StreamType.one(JType.array(mapped.item));
       }
       if ("Union" in input) {
-        return StreamType.one(
-          JType.union(input.Union.map((item) => this.mapCall(mapper, item).item)),
+        const mapped = JType.union(
+          input.Union.map((item) => this.mapCall(mapper, item).item),
         );
+        this.missingPathNull = false;
+        return StreamType.one(mapped);
       }
     }
-    if (input === "Unknown") return StreamType.one(JType.array("Unknown"));
+    if (input === "Unknown") {
+      this.missingPathNull = false;
+      return StreamType.one(JType.array("Unknown"));
+    }
+    if (input === "Null" && this.missingPathNull) {
+      this.missingPathNull = false;
+      return StreamType.one("Unknown");
+    }
+    this.missingPathNull = false;
     this.warnOrError(
       `map may be applied to non-array/non-object input: ${JType.toCompactString(input)}`,
     );
@@ -962,13 +1052,21 @@ class Analyzer {
   addType(input: JTypeT): JTypeT {
     if (typeof input === "object") {
       if ("Array" in input) {
+        this.missingPathNull = false;
         const item = input.Array.items;
         if (item === "Never") return "Null";
         return JType.union([mathType("+", item, item), "Null"]);
       }
       if ("Union" in input) return JType.union(input.Union.map((item) => this.addType(item)));
     }
-    if (input === "Unknown") return "Unknown";
+    if (input === "Null" && this.missingPathNull) {
+      this.missingPathNull = false;
+      return "Unknown";
+    }
+    if (input === "Unknown") {
+      this.missingPathNull = false;
+      return "Unknown";
+    }
     this.warnOrError(
       `add may be applied to non-array input: ${JType.toCompactString(input)}`,
     );
@@ -978,6 +1076,7 @@ class Analyzer {
   transposeType(input: JTypeT): JTypeT {
     if (typeof input === "object") {
       if ("Array" in input) {
+        this.missingPathNull = false;
         const item = input.Array.items;
         if (typeof item === "object" && "Array" in item) {
           return JType.array(JType.array(item.Array.items));
@@ -992,7 +1091,14 @@ class Analyzer {
         return JType.union(input.Union.map((item) => this.transposeType(item)));
       }
     }
-    if (input === "Unknown") return JType.array(JType.array("Unknown"));
+    if (input === "Null" && this.missingPathNull) {
+      this.missingPathNull = false;
+      return "Unknown";
+    }
+    if (input === "Unknown") {
+      this.missingPathNull = false;
+      return JType.array(JType.array("Unknown"));
+    }
     this.warnOrError(
       `transpose may be applied to non-array input: ${JType.toCompactString(input)}`,
     );
@@ -1171,6 +1277,13 @@ class Analyzer {
     const start = this.source.indexOf(token);
     if (start < 0) return null;
     return { start, end: start + token.length };
+  }
+
+  spanForProperty(key: string): SourceSpan | null {
+    const dotted = `.${key}`;
+    const dottedSpan = this.spanForToken(dotted);
+    if (dottedSpan !== null) return dottedSpan;
+    return this.spanForToken(key);
   }
 }
 

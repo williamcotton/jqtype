@@ -263,6 +263,65 @@ describe("analyzer — small cases", () => {
     expect(StreamType.toCompactString(joined.output)).toBe("string");
   });
 
+  it("reports missing root property without cascading map diagnostic", () => {
+    const input = jsonSchemaToType({
+      type: "object",
+      properties: {
+        method: { type: "string" },
+        params: { type: "object", additionalProperties: true },
+        query: { type: "object", additionalProperties: true },
+      },
+      required: ["method", "params", "query"],
+      additionalProperties: false,
+    });
+
+    const r = check(".data.rows | map(.name)", input);
+    expect(r.diagnostics).toHaveLength(1);
+    expect(r.diagnostics[0]?.message).toContain(
+      'property "data" is not present on object',
+    );
+    expect(r.diagnostics[0]?.message).not.toContain("map may be applied");
+    expect(r.diagnostics[0]?.span).toEqual({ start: 0, end: 5 });
+    expect(StreamType.toCompactString(r.output)).toBe("unknown");
+  });
+
+  it("reports map item missing property against the item shape", () => {
+    const input = jsonSchemaToType({
+      type: "object",
+      properties: {
+        data: {
+          type: "object",
+          properties: {
+            rows: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  id: { type: "string" },
+                  name: { type: "string" },
+                },
+                required: ["id", "name"],
+                additionalProperties: false,
+              },
+            },
+          },
+          required: ["rows"],
+          additionalProperties: false,
+        },
+      },
+      required: ["data"],
+      additionalProperties: false,
+    });
+
+    const r = check(".data.rows | map(.namei)", input);
+    expect(r.diagnostics).toHaveLength(1);
+    expect(r.diagnostics[0]?.message).toContain(
+      'property "namei" is not present on object{id: string, name: string}',
+    );
+    expect(r.diagnostics[0]?.span).toEqual({ start: 17, end: 23 });
+    expect(StreamType.toCompactString(r.output)).toBe("array<null>");
+  });
+
   it("slices and interpolation are analyzed", () => {
     const input = jsonSchemaToType({
       type: "object",

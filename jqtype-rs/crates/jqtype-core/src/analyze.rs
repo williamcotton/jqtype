@@ -222,6 +222,7 @@ struct Analyzer {
     diagnostics: Vec<Diagnostic>,
     unsupported_features: Vec<UnsupportedFeature>,
     env: BTreeMap<String, JType>,
+    missing_path_null: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -237,6 +238,7 @@ impl Analyzer {
             diagnostics: Vec::new(),
             unsupported_features: Vec::new(),
             env: BTreeMap::new(),
+            missing_path_null: false,
         }
     }
 
@@ -373,9 +375,22 @@ impl Analyzer {
             Part::Range(None, None) => self.iterate(input, matches!(opt, Opt::Optional), 0..0),
             Part::Range(_, _) => {
                 let item = match input {
-                    JType::Array(array) => JType::array((*array.items).clone()),
-                    JType::String(_) => JType::string(),
-                    JType::Unknown => JType::Unknown,
+                    JType::Array(array) => {
+                        self.missing_path_null = false;
+                        JType::array((*array.items).clone())
+                    }
+                    JType::String(_) => {
+                        self.missing_path_null = false;
+                        JType::string()
+                    }
+                    JType::Null if self.missing_path_null => {
+                        self.missing_path_null = false;
+                        JType::Unknown
+                    }
+                    JType::Unknown => {
+                        self.missing_path_null = false;
+                        JType::Unknown
+                    }
                     JType::Union(items) => JType::union(
                         items
                             .into_iter()
@@ -462,6 +477,14 @@ impl Analyzer {
                 self.env.remove(name);
             }
         }
+        out
+    }
+
+    fn with_fresh_missing_path_scope<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let previous = self.missing_path_null;
+        self.missing_path_null = false;
+        let out = f(self);
+        self.missing_path_null = previous;
         out
     }
 
@@ -772,6 +795,7 @@ impl Analyzer {
     fn keys_type(&mut self, input: JType) -> JType {
         match input {
             JType::Object(object) => {
+                self.missing_path_null = false;
                 let mut keys = object
                     .properties
                     .keys()
@@ -783,9 +807,19 @@ impl Analyzer {
                 }
                 JType::array(JType::union(keys))
             }
-            JType::Array(_) => JType::array(JType::number()),
+            JType::Array(_) => {
+                self.missing_path_null = false;
+                JType::array(JType::number())
+            }
             JType::Union(items) => JType::union(items.into_iter().map(|item| self.keys_type(item))),
-            JType::Unknown => JType::array(JType::union([JType::string(), JType::number()])),
+            JType::Null if self.missing_path_null => {
+                self.missing_path_null = false;
+                JType::Unknown
+            }
+            JType::Unknown => {
+                self.missing_path_null = false;
+                JType::array(JType::union([JType::string(), JType::number()]))
+            }
             other => {
                 self.warn_or_error(
                     format!(
@@ -802,7 +836,10 @@ impl Analyzer {
     fn map_call(&mut self, mapper: &SpannedFilter, input: JType) -> StreamType {
         match input {
             JType::Array(array) => {
-                let mapped = self.analyze(mapper, *array.items);
+                let mapped = self.with_fresh_missing_path_scope(|analyzer| {
+                    analyzer.analyze(mapper, *array.items)
+                });
+                self.missing_path_null = false;
                 StreamType::one(JType::array(mapped.item))
             }
             JType::Object(object) => {
@@ -814,16 +851,31 @@ impl Analyzer {
                 if let Some(additional) = object.additional {
                     values.push(*additional);
                 }
-                let mapped = self.analyze(mapper, JType::union(values));
+                let mapped = self.with_fresh_missing_path_scope(|analyzer| {
+                    analyzer.analyze(mapper, JType::union(values))
+                });
+                self.missing_path_null = false;
                 StreamType::one(JType::array(mapped.item))
             }
-            JType::Union(items) => StreamType::one(JType::union(
-                items
-                    .into_iter()
-                    .map(|item| self.map_call(mapper, item).item),
-            )),
-            JType::Unknown => StreamType::one(JType::array(JType::Unknown)),
+            JType::Union(items) => {
+                let mapped = JType::union(
+                    items
+                        .into_iter()
+                        .map(|item| self.map_call(mapper, item).item),
+                );
+                self.missing_path_null = false;
+                StreamType::one(mapped)
+            }
+            JType::Unknown => {
+                self.missing_path_null = false;
+                StreamType::one(JType::array(JType::Unknown))
+            }
+            JType::Null if self.missing_path_null => {
+                self.missing_path_null = false;
+                StreamType::one(JType::Unknown)
+            }
             other => {
+                self.missing_path_null = false;
                 self.warn_or_error(
                     format!(
                         "map may be applied to non-array/non-object input: {}",
@@ -839,6 +891,7 @@ impl Analyzer {
     fn add_type(&mut self, input: JType) -> JType {
         match input {
             JType::Array(array) => {
+                self.missing_path_null = false;
                 let item = *array.items;
                 if item.is_never() {
                     JType::Null
@@ -847,7 +900,14 @@ impl Analyzer {
                 }
             }
             JType::Union(items) => JType::union(items.into_iter().map(|item| self.add_type(item))),
-            JType::Unknown => JType::Unknown,
+            JType::Null if self.missing_path_null => {
+                self.missing_path_null = false;
+                JType::Unknown
+            }
+            JType::Unknown => {
+                self.missing_path_null = false;
+                JType::Unknown
+            }
             other => {
                 self.warn_or_error(
                     format!(
@@ -863,24 +923,34 @@ impl Analyzer {
 
     fn transpose_type(&mut self, input: JType) -> JType {
         match input {
-            JType::Array(array) => match *array.items {
-                JType::Array(inner) => JType::array(JType::array(*inner.items)),
-                JType::Unknown => JType::array(JType::array(JType::Unknown)),
-                other => {
-                    self.warn_or_error(
-                        format!(
-                            "transpose may be applied to non-array items: {}",
-                            other.to_compact_string()
-                        ),
-                        None,
-                    );
-                    JType::array(JType::array(JType::Unknown))
+            JType::Array(array) => {
+                self.missing_path_null = false;
+                match *array.items {
+                    JType::Array(inner) => JType::array(JType::array(*inner.items)),
+                    JType::Unknown => JType::array(JType::array(JType::Unknown)),
+                    other => {
+                        self.warn_or_error(
+                            format!(
+                                "transpose may be applied to non-array items: {}",
+                                other.to_compact_string()
+                            ),
+                            None,
+                        );
+                        JType::array(JType::array(JType::Unknown))
+                    }
                 }
-            },
+            }
             JType::Union(items) => {
                 JType::union(items.into_iter().map(|item| self.transpose_type(item)))
             }
-            JType::Unknown => JType::array(JType::array(JType::Unknown)),
+            JType::Null if self.missing_path_null => {
+                self.missing_path_null = false;
+                JType::Unknown
+            }
+            JType::Unknown => {
+                self.missing_path_null = false;
+                JType::array(JType::array(JType::Unknown))
+            }
             other => {
                 self.warn_or_error(
                     format!(
@@ -898,19 +968,36 @@ impl Analyzer {
         match input {
             JType::Object(object) => {
                 if let Some(prop) = object.properties.get(key) {
+                    self.missing_path_null = false;
                     if prop.required {
                         StreamType::one(prop.ty.clone())
                     } else {
                         StreamType::one(JType::union([prop.ty.clone(), JType::Null]))
                     }
                 } else if let Some(additional) = object.additional {
+                    self.missing_path_null = false;
                     StreamType::one(JType::union([*additional, JType::Null]))
                 } else {
+                    if optional {
+                        self.missing_path_null = false;
+                    } else {
+                        self.warn_or_error(
+                            format!(
+                                "property \"{key}\" is not present on {}",
+                                JType::Object(object).to_compact_string()
+                            ),
+                            Some(span),
+                        );
+                        self.missing_path_null = true;
+                    }
                     StreamType::one(JType::Null)
                 }
             }
             JType::Null => StreamType::one(JType::Null),
-            JType::Unknown => StreamType::one(JType::Unknown),
+            JType::Unknown => {
+                self.missing_path_null = false;
+                StreamType::one(JType::Unknown)
+            }
             JType::Union(items) => {
                 let mut out = StreamType::zero();
                 for item in items {
@@ -919,6 +1006,7 @@ impl Analyzer {
                 out
             }
             other if optional => {
+                self.missing_path_null = false;
                 self.warn_or_error(
                     format!(
                         "optional field `{key}` skipped non-object input: {}",
@@ -929,6 +1017,7 @@ impl Analyzer {
                 StreamType::zero()
             }
             other => {
+                self.missing_path_null = false;
                 self.warn_or_error(
                     format!(
                         "field `{key}` may be applied to non-object input: {}",
@@ -949,9 +1038,22 @@ impl Analyzer {
         span: Span,
     ) -> StreamType {
         match input {
-            JType::Array(array) => StreamType::one(JType::union([*array.items, JType::Null])),
-            JType::String(_) => StreamType::one(JType::union([JType::string(), JType::Null])),
-            JType::Unknown => StreamType::one(JType::Unknown),
+            JType::Array(array) => {
+                self.missing_path_null = false;
+                StreamType::one(JType::union([*array.items, JType::Null]))
+            }
+            JType::String(_) => {
+                self.missing_path_null = false;
+                StreamType::one(JType::union([JType::string(), JType::Null]))
+            }
+            JType::Null if self.missing_path_null => {
+                self.missing_path_null = false;
+                StreamType::one(JType::Unknown)
+            }
+            JType::Unknown => {
+                self.missing_path_null = false;
+                StreamType::one(JType::Unknown)
+            }
             JType::Union(items) => {
                 let mut out = StreamType::zero();
                 for item in items {
@@ -984,8 +1086,12 @@ impl Analyzer {
 
     fn access_dynamic_index(&mut self, input: JType, optional: bool, span: Span) -> StreamType {
         match input {
-            JType::Array(array) => StreamType::one(JType::union([*array.items, JType::Null])),
+            JType::Array(array) => {
+                self.missing_path_null = false;
+                StreamType::one(JType::union([*array.items, JType::Null]))
+            }
             JType::Object(object) => {
+                self.missing_path_null = false;
                 let mut values = object
                     .properties
                     .values()
@@ -997,7 +1103,14 @@ impl Analyzer {
                 values.push(JType::Null);
                 StreamType::one(JType::union(values))
             }
-            JType::Unknown => StreamType::one(JType::Unknown),
+            JType::Null if self.missing_path_null => {
+                self.missing_path_null = false;
+                StreamType::one(JType::Unknown)
+            }
+            JType::Unknown => {
+                self.missing_path_null = false;
+                StreamType::one(JType::Unknown)
+            }
             JType::Union(items) => {
                 let mut out = StreamType::zero();
                 for item in items {
@@ -1030,8 +1143,12 @@ impl Analyzer {
 
     fn iterate(&mut self, input: JType, optional: bool, span: Span) -> StreamType {
         match input {
-            JType::Array(array) => StreamType::zero_or_more(*array.items),
+            JType::Array(array) => {
+                self.missing_path_null = false;
+                StreamType::zero_or_more(*array.items)
+            }
             JType::Object(object) => {
+                self.missing_path_null = false;
                 let mut values = object
                     .properties
                     .values()
@@ -1042,7 +1159,14 @@ impl Analyzer {
                 }
                 StreamType::zero_or_more(JType::union(values))
             }
-            JType::Unknown => StreamType::zero_or_more(JType::Unknown),
+            JType::Null if self.missing_path_null => {
+                self.missing_path_null = false;
+                StreamType::zero_or_more(JType::Unknown)
+            }
+            JType::Unknown => {
+                self.missing_path_null = false;
+                StreamType::zero_or_more(JType::Unknown)
+            }
             JType::Union(items) => {
                 let mut out = StreamType::zero();
                 for item in items {
@@ -2305,6 +2429,71 @@ mod tests {
         let report = check(".keys | map(tostring) | join(\",\")", input);
         assert!(report.unsupported_features.is_empty());
         assert_eq!(report.output.to_compact_string(), "string");
+    }
+
+    #[test]
+    fn missing_root_property_reports_without_map_cascade() {
+        let input = json_schema_to_type(&json!({
+            "type": "object",
+            "properties": {
+                "method": { "type": "string" },
+                "params": { "type": "object", "additionalProperties": true },
+                "query": { "type": "object", "additionalProperties": true }
+            },
+            "required": ["method", "params", "query"],
+            "additionalProperties": false
+        }));
+
+        let report = check(".data.rows | map(.name)", input);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert!(
+            report.diagnostics[0]
+                .message
+                .contains("property \"data\" is not present on object")
+        );
+        assert!(!report.diagnostics[0].message.contains("map may be applied"));
+        assert!(report.diagnostics[0].span.is_some());
+        assert_eq!(report.output.to_compact_string(), "unknown");
+    }
+
+    #[test]
+    fn map_item_missing_property_reports_on_item_shape() {
+        let input = json_schema_to_type(&json!({
+            "type": "object",
+            "properties": {
+                "data": {
+                    "type": "object",
+                    "properties": {
+                        "rows": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "name": { "type": "string" }
+                                },
+                                "required": ["id", "name"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["rows"],
+                    "additionalProperties": false
+                }
+            },
+            "required": ["data"],
+            "additionalProperties": false
+        }));
+
+        let report = check(".data.rows | map(.namei)", input);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert!(
+            report.diagnostics[0]
+                .message
+                .contains("property \"namei\" is not present on object{id: string, name: string}")
+        );
+        assert!(report.diagnostics[0].span.is_some());
+        assert_eq!(report.output.to_compact_string(), "array<null>");
     }
 
     #[test]

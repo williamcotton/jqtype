@@ -4,7 +4,9 @@ import { StreamType } from "../src/stream.js";
 import {
   AnalyzeOptions,
   InputShape,
+  JQTYPE_CAPABILITIES,
   JqTypeChecker,
+  analyzeFilter,
   type AnalyzeReport,
 } from "../src/analyze.js";
 import { jsonSchemaToType } from "../src/schema.js";
@@ -318,6 +320,49 @@ describe("analyzer — small cases", () => {
     expect(compact).toContain("object{}");
     expect(compact).toContain("...: array<object");
     expect(compact).toContain("team_id: number | string");
+  });
+
+  it("top-level sync API supports partial options and external variables", () => {
+    const report = analyzeFilter(
+      "{ user: $user.name, fallback: ($missing // \"none\") }",
+      InputShape.unknown(),
+      {
+        externalVars: {
+          user: JType.closedObject({
+            name: JType.property(JType.stringLit("Ada"), true),
+          }),
+          missing: "Null",
+        },
+      },
+    );
+
+    expect(report.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(report.output)).toBe(
+      'object{fallback: "none", user: "Ada"}',
+    );
+    expect(JSON.parse(JSON.stringify(report))).toEqual(report);
+  });
+
+  it("capability matrix is exported as plain data", () => {
+    expect(JQTYPE_CAPABILITIES.some((cap) => cap.feature === "map")).toBe(true);
+    expect(JSON.parse(JSON.stringify(JQTYPE_CAPABILITIES))).toEqual(
+      JQTYPE_CAPABILITIES,
+    );
+  });
+
+  it("diagnostics include jq-source spans where available", () => {
+    const parseReport = analyzeFilter(".foo |");
+    expect(parseReport.diagnostics[0]?.span).toEqual({ start: 6, end: 6 });
+
+    const unsupported = analyzeFilter("group_by(.name)");
+    expect(unsupported.diagnostics[0]?.span).toEqual({ start: 0, end: 8 });
+    expect(unsupported.unsupported_features[0]?.span).toEqual({
+      start: 0,
+      end: 8,
+    });
+
+    const unbound = analyzeFilter("$context.foo");
+    expect(unbound.diagnostics[0]?.span).toEqual({ start: 0, end: 8 });
   });
 
   it("unsupported builtin produces a warning", () => {

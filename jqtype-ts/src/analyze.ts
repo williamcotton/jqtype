@@ -31,11 +31,21 @@ export type AnalysisMode = "Permissive" | "Strict";
 export type OutputFormat = "Compact" | "JsonSchema" | "Tree";
 
 export interface AnalyzeOptions {
+  mode?: AnalysisMode;
+  source_name?: string | null;
+  output_format?: OutputFormat;
+  max_union_members?: number;
+  max_recursion_depth?: number;
+  externalVars?: Record<string, JTypeT>;
+}
+
+interface ResolvedAnalyzeOptions {
   mode: AnalysisMode;
   source_name: string | null;
   output_format: OutputFormat;
   max_union_members: number;
   max_recursion_depth: number;
+  externalVars: Record<string, JTypeT>;
 }
 
 export const AnalyzeOptions = {
@@ -46,9 +56,36 @@ export const AnalyzeOptions = {
       output_format: "Compact",
       max_union_members: 32,
       max_recursion_depth: 32,
+      externalVars: {},
     };
   },
 };
+
+export type CapabilityStatus = "supported" | "partial" | "unsupported";
+
+export interface JqtypeCapability {
+  feature: string;
+  status: CapabilityStatus;
+  notes: string | null;
+}
+
+export const JQTYPE_CAPABILITIES: JqtypeCapability[] = [
+  { feature: "object constructors", status: "supported", notes: null },
+  { feature: "array constructors", status: "supported", notes: null },
+  { feature: "field/index access", status: "supported", notes: "Dynamic indexes are conservative." },
+  { feature: "map", status: "supported", notes: "Arrays and object values are modeled." },
+  { feature: "select", status: "supported", notes: "Common predicates refine object shapes." },
+  { feature: "if/elif/else", status: "supported", notes: "Branch outputs are joined conservatively." },
+  { feature: "alternative operator //", status: "supported", notes: null },
+  { feature: "length", status: "supported", notes: null },
+  { feature: "type", status: "supported", notes: null },
+  { feature: "tonumber", status: "supported", notes: null },
+  { feature: "tostring", status: "supported", notes: null },
+  { feature: "object merge via +", status: "supported", notes: null },
+  { feature: "identity-root updates", status: "partial", notes: "Literal fields, indexes, iterators, and string-like dynamic keys are modeled." },
+  { feature: "external variables", status: "supported", notes: "Provide AnalyzeOptions.externalVars." },
+  { feature: "def/modules", status: "unsupported", notes: "Reported as unsupported features." },
+];
 
 export interface UnsupportedFeature {
   feature: string;
@@ -76,6 +113,14 @@ export const AnalyzeReport = {
     };
   },
 };
+
+export function analyzeFilter(
+  source: string,
+  input: InputShape = InputShape.unknown(),
+  options: AnalyzeOptions = AnalyzeOptions.default(),
+): AnalyzeReport {
+  return new JqTypeChecker().analyzeFilter(source, input, options);
+}
 
 export type InputShape =
   | { Type: JTypeT }
@@ -120,21 +165,22 @@ export class JqTypeChecker {
 
   analyzeFilter(
     source: string,
-    input: InputShape,
-    options: AnalyzeOptions,
+    input: InputShape = InputShape.unknown(),
+    options: AnalyzeOptions = AnalyzeOptions.default(),
   ): AnalyzeReport {
-    const sourceName = options.source_name;
+    const resolvedOptions = resolveAnalyzeOptions(options);
+    const sourceName = resolvedOptions.source_name;
     const parsed = parseFilter(source);
     if (!parsed.ok) {
       return parseFailureReport(parsed.message, source, sourceName);
     }
 
     const debugAst =
-      options.output_format === "Tree"
+      resolvedOptions.output_format === "Tree"
         ? JSON.stringify(parsed.ast, null, 2)
         : null;
 
-    const analyzer = new Analyzer(options);
+    const analyzer = new Analyzer(resolvedOptions, source);
     const inputTy = InputShape.intoType(input);
     const output = analyzer.analyzeProg(parsed.ast, inputTy);
     return {
@@ -155,10 +201,10 @@ function parseFailureReport(
     output: StreamType.zero(),
     diagnostics: [
       Diagnostic.withSourceName(
-        Diagnostic.error(`failed to parse jq filter: ${message}`, {
-          start: 0,
-          end: source.length,
-        }),
+        Diagnostic.error(
+          `failed to parse jq filter: ${message}`,
+          parseErrorSpan(message, source),
+        ),
         sourceName,
       ),
     ],
@@ -167,14 +213,51 @@ function parseFailureReport(
   };
 }
 
+function resolveAnalyzeOptions(options: AnalyzeOptions): ResolvedAnalyzeOptions {
+  return {
+    mode: options.mode ?? "Permissive",
+    source_name: options.source_name ?? null,
+    output_format: options.output_format ?? "Compact",
+    max_union_members: options.max_union_members ?? 32,
+    max_recursion_depth: options.max_recursion_depth ?? 32,
+    externalVars: options.externalVars ?? {},
+  };
+}
+
+function parseErrorSpan(message: string, source: string): SourceSpan | null {
+  const match = /\((\d+):(\d+)\)/.exec(message);
+  if (!match) return source.length === 0 ? { start: 0, end: 0 } : { start: 0, end: source.length };
+  const line = Number(match[1]);
+  const column = Number(match[2]);
+  if (!Number.isFinite(line) || !Number.isFinite(column)) return null;
+  const start = offsetFromLineColumn(source, line, column);
+  const end = start >= source.length ? start : start + 1;
+  return { start, end };
+}
+
+function offsetFromLineColumn(source: string, line: number, column: number): number {
+  let offset = 0;
+  for (let currentLine = 1; currentLine < line && offset < source.length; currentLine += 1) {
+    const nextNewline = source.indexOf("\n", offset);
+    if (nextNewline < 0) return source.length;
+    offset = nextNewline + 1;
+  }
+  return Math.min(source.length, offset + Math.max(0, column));
+}
+
 class Analyzer {
-  options: AnalyzeOptions;
+  options: ResolvedAnalyzeOptions;
+  source: string;
   diagnostics: Diagnostic[] = [];
   unsupportedFeatures: UnsupportedFeature[] = [];
   env = new Map<string, JTypeT>();
 
-  constructor(options: AnalyzeOptions) {
+  constructor(options: ResolvedAnalyzeOptions, source: string) {
     this.options = options;
+    this.source = source;
+    for (const [name, ty] of Object.entries(options.externalVars)) {
+      this.env.set(normalizeVarName(name), ty);
+    }
   }
 
   analyzeProg(prog: ProgAst, input: JTypeT): StreamType {
@@ -220,7 +303,11 @@ class Analyzer {
           const name = normalizeVarName(expr.name);
           const bound = this.env.get(name);
           if (bound !== undefined) return StreamType.one(bound);
-          return this.unsupported(`variables are not supported yet: $${name}`, "Unknown");
+          return this.unsupported(
+            `unbound jq variable: $${name}`,
+            "Unknown",
+            this.spanForToken(`$${name}`),
+          );
         }
       case "varDeclaration":
         return this.analyzeVarDeclaration(expr, input);
@@ -232,20 +319,23 @@ class Analyzer {
         return this.unsupported(
           "recursive descent is not supported yet",
           input,
+          this.spanForToken(".."),
         );
       case "def":
         return this.unsupported(
           "function definitions are not supported yet",
           "Unknown",
+          this.spanForToken("def"),
         );
       case "label":
       case "break":
         return this.unsupported(
           "labels and break are not supported yet",
           input,
+          this.spanForToken(expr.type),
         );
       case "format":
-        return this.unsupported("formats are not supported yet", input);
+        return this.unsupported("formats are not supported yet", input, this.spanForToken("@"));
     }
   }
 
@@ -619,7 +709,11 @@ class Analyzer {
     ) {
       return this.analyzeAssignment(node.left, op, node.right, input);
     }
-    return this.unsupported(`unsupported binary operator \`${op}\``, "Unknown");
+    return this.unsupported(
+      `unsupported binary operator \`${op}\``,
+      "Unknown",
+      this.spanForToken(op),
+    );
   }
 
   analyzeAssignment(
@@ -751,7 +845,11 @@ class Analyzer {
     if (name === "strings" && args.length === 0) return this.filterKind(input, "string");
     if (name === "arrays" && args.length === 0) return this.filterKind(input, "array");
     if (name === "objects" && args.length === 0) return this.filterKind(input, "object");
-    return this.unsupported(`unsupported builtin or call \`${name}\``, "Unknown");
+    return this.unsupported(
+      `unsupported builtin or call \`${name}\``,
+      "Unknown",
+      this.spanForToken(name),
+    );
   }
 
   analyzePredicate(expr: ExpressionAst, input: JTypeT): PredicateRefinement {
@@ -1048,9 +1146,13 @@ class Analyzer {
     return "Unknown";
   }
 
-  unsupported(feature: string, fallback: JTypeT): StreamType {
-    this.unsupportedFeatures.push({ feature, span: null });
-    this.warnOrError(feature);
+  unsupported(
+    feature: string,
+    fallback: JTypeT,
+    span: SourceSpan | null = null,
+  ): StreamType {
+    this.unsupportedFeatures.push({ feature, span });
+    this.warnOrError(feature, span);
     return StreamType.one(fallback);
   }
 
@@ -1062,6 +1164,13 @@ class Analyzer {
     this.diagnostics.push(
       Diagnostic.withSourceName(base, this.options.source_name),
     );
+  }
+
+  spanForToken(token: string): SourceSpan | null {
+    if (token.length === 0) return null;
+    const start = this.source.indexOf(token);
+    if (start < 0) return null;
+    return { start, end: start + token.length };
   }
 }
 

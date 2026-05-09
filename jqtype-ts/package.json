@@ -1,14 +1,17 @@
 {
   "name": "jqtype",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "TypeScript port of jqtype: static type analysis for jq filters, intended for embedding in language servers.",
   "type": "module",
-  "main": "./dist/index.js",
+  "sideEffects": false,
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
     }
   },
   "files": [
@@ -16,7 +19,7 @@
     "src"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsup",
     "prepack": "npm run build",
     "clean": "rm -rf dist",
     "check": "tsc --noEmit",
@@ -35,6 +38,7 @@
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^25.6.2",
+    "tsup": "^8.5.0",
     "tsx": "^4.21.0",
     "typescript": "^6.0.3",
     "vitest": "^3.2.4"

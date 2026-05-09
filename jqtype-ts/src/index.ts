@@ -2,8 +2,12 @@ export {
   AnalyzeOptions,
   AnalyzeReport,
   InputShape,
+  JQTYPE_CAPABILITIES,
   JqTypeChecker,
+  analyzeFilter,
   type AnalysisMode,
+  type CapabilityStatus,
+  type JqtypeCapability,
   type OutputFormat,
   type UnsupportedFeature,
 } from "./analyze.js";

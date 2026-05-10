@@ -15,6 +15,77 @@ use crate::types::{BoolType, JType, NumberType, Property, StringType};
 type Filter = JaqFilter<String, String, String>;
 type SpannedFilter = Spanned<Filter>;
 
+const NUMERIC_ZERO_ARG_BUILTINS: &[&str] = &[
+    "acos",
+    "acosh",
+    "asin",
+    "asinh",
+    "atan",
+    "atanh",
+    "cbrt",
+    "ceil",
+    "cos",
+    "cosh",
+    "erf",
+    "erfc",
+    "exp",
+    "exp10",
+    "exp2",
+    "expm1",
+    "fabs",
+    "floor",
+    "ilogb",
+    "infinite",
+    "j0",
+    "j1",
+    "lgamma",
+    "log",
+    "log10",
+    "log1p",
+    "log2",
+    "logb",
+    "nan",
+    "nearbyint",
+    "rint",
+    "round",
+    "sin",
+    "sinh",
+    "sqrt",
+    "tan",
+    "tanh",
+    "tgamma",
+    "trunc",
+    "y0",
+    "y1",
+];
+
+const NUMERIC_PAIR_ZERO_ARG_BUILTINS: &[&str] = &["frexp", "lgamma_r", "modf"];
+
+const NUMERIC_PREDICATE_ZERO_ARG_BUILTINS: &[&str] =
+    &["isfinite", "isinfinite", "isnan", "isnormal", "signbit"];
+
+const NUMERIC_TWO_ARG_BUILTINS: &[&str] = &[
+    "atan2",
+    "copysign",
+    "fdim",
+    "fmax",
+    "fmin",
+    "fmod",
+    "hypot",
+    "jn",
+    "ldexp",
+    "nextafter",
+    "nexttoward",
+    "pow",
+    "remainder",
+    "scalb",
+    "scalbln",
+    "scalbn",
+    "yn",
+];
+
+const NUMERIC_THREE_ARG_BUILTINS: &[&str] = &["fma"];
+
 /// Controls whether possibly-invalid operations widen to `Unknown` with a
 /// warning ([`AnalysisMode::Permissive`]) or become hard errors that can
 /// produce a non-zero exit code ([`AnalysisMode::Strict`]).
@@ -622,7 +693,15 @@ impl Analyzer {
             ("length", []) => StreamType::one(JType::number()),
             ("tostring", []) => StreamType::one(tostring_type(input)),
             ("tonumber", []) => StreamType::one(tonumber_type(input)),
-            ("floor", []) => StreamType::one(JType::number()),
+            (name, []) if NUMERIC_ZERO_ARG_BUILTINS.contains(&name) => {
+                StreamType::one(JType::number())
+            }
+            (name, []) if NUMERIC_PAIR_ZERO_ARG_BUILTINS.contains(&name) => {
+                StreamType::one(JType::array(JType::number()))
+            }
+            (name, []) if NUMERIC_PREDICATE_ZERO_ARG_BUILTINS.contains(&name) => {
+                StreamType::one(JType::bool())
+            }
             ("now", []) => StreamType::one(JType::number()),
             ("keys", []) => StreamType::one(self.keys_type(input)),
             ("not", []) => StreamType::one(not_type(input)),
@@ -639,6 +718,29 @@ impl Analyzer {
             }
             ("map", [mapper]) => self.map_call(mapper, input),
             ("add", []) => StreamType::one(self.add_type(input)),
+            ("flatten", []) => StreamType::one(self.flatten_type(input, FlattenDepth::Full)),
+            ("flatten", [depth]) => {
+                let depth_ty = self.analyze(depth, input.clone()).item;
+                StreamType::one(self.flatten_type(input, flatten_depth_from_type(&depth_ty)))
+            }
+            ("range", [_]) | ("range", [_, _]) | ("range", [_, _, _]) => {
+                for arg in args {
+                    let _ = self.analyze(arg, input.clone());
+                }
+                StreamType::zero_or_more(JType::number())
+            }
+            (name, [_, _]) if NUMERIC_TWO_ARG_BUILTINS.contains(&name) => {
+                for arg in args {
+                    let _ = self.analyze(arg, input.clone());
+                }
+                StreamType::one(JType::number())
+            }
+            (name, [_, _, _]) if NUMERIC_THREE_ARG_BUILTINS.contains(&name) => {
+                for arg in args {
+                    let _ = self.analyze(arg, input.clone());
+                }
+                StreamType::one(JType::number())
+            }
             ("join", [separator]) => {
                 let _ = self.analyze(separator, input.clone());
                 StreamType::one(JType::string())
@@ -912,6 +1014,36 @@ impl Analyzer {
                 self.warn_or_error(
                     format!(
                         "add may be applied to non-array input: {}",
+                        other.to_compact_string()
+                    ),
+                    None,
+                );
+                JType::Unknown
+            }
+        }
+    }
+
+    fn flatten_type(&mut self, input: JType, depth: FlattenDepth) -> JType {
+        match input {
+            JType::Array(array) => {
+                self.missing_path_null = false;
+                JType::array(flatten_item(*array.items, depth))
+            }
+            JType::Union(items) => {
+                JType::union(items.into_iter().map(|item| self.flatten_type(item, depth)))
+            }
+            JType::Null if self.missing_path_null => {
+                self.missing_path_null = false;
+                JType::Unknown
+            }
+            JType::Unknown => {
+                self.missing_path_null = false;
+                JType::array(JType::Unknown)
+            }
+            other => {
+                self.warn_or_error(
+                    format!(
+                        "flatten may be applied to non-array input: {}",
                         other.to_compact_string()
                     ),
                     None,
@@ -2136,6 +2268,70 @@ fn kind_to_type(kind: &str) -> JType {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FlattenDepth {
+    Full,
+    Exact(usize),
+    Unknown,
+}
+
+fn flatten_depth_from_type(input: &JType) -> FlattenDepth {
+    match input {
+        JType::Number(NumberType::Literal(value)) => value
+            .parse::<usize>()
+            .ok()
+            .map(FlattenDepth::Exact)
+            .unwrap_or(FlattenDepth::Unknown),
+        _ => FlattenDepth::Unknown,
+    }
+}
+
+fn flatten_item(input: JType, depth: FlattenDepth) -> JType {
+    match depth {
+        FlattenDepth::Full => flatten_item_full(input),
+        FlattenDepth::Exact(depth) => flatten_item_exact(input, depth),
+        FlattenDepth::Unknown => flatten_item_unknown_depth(input),
+    }
+}
+
+fn flatten_item_full(input: JType) -> JType {
+    match input {
+        JType::Array(array) => flatten_item_full(*array.items),
+        JType::Union(items) => JType::union(items.into_iter().map(flatten_item_full)),
+        other => other,
+    }
+}
+
+fn flatten_item_exact(input: JType, depth: usize) -> JType {
+    if depth == 0 {
+        return input;
+    }
+
+    match input {
+        JType::Array(array) => flatten_item_exact(*array.items, depth - 1),
+        JType::Union(items) => JType::union(
+            items
+                .into_iter()
+                .map(|item| flatten_item_exact(item, depth)),
+        ),
+        other => other,
+    }
+}
+
+fn flatten_item_unknown_depth(input: JType) -> JType {
+    match input {
+        JType::Array(array) => {
+            let nested = (*array.items).clone();
+            JType::union([
+                JType::array(nested.clone()),
+                flatten_item_unknown_depth(nested),
+            ])
+        }
+        JType::Union(items) => JType::union(items.into_iter().map(flatten_item_unknown_depth)),
+        other => other,
+    }
+}
+
 fn flatten_union(input: JType) -> Vec<JType> {
     match input {
         JType::Union(items) => items,
@@ -2429,6 +2625,62 @@ mod tests {
         let report = check(".keys | map(tostring) | join(\",\")", input);
         assert!(report.unsupported_features.is_empty());
         assert_eq!(report.output.to_compact_string(), "string");
+    }
+
+    #[test]
+    fn flatten_range_and_numeric_builtins_are_analyzed() {
+        let nested = json_schema_to_type(&json!({
+            "type": "array",
+            "items": {
+                "anyOf": [
+                    { "type": "number" },
+                    {
+                        "type": "array",
+                        "items": {
+                            "anyOf": [
+                                { "type": "number" },
+                                { "type": "array", "items": { "type": "number" } }
+                            ]
+                        }
+                    }
+                ]
+            }
+        }));
+
+        let flattened = check("flatten", nested.clone());
+        assert!(flattened.unsupported_features.is_empty());
+        assert_eq!(flattened.output.to_compact_string(), "array<number>");
+
+        let flattened_once = check("flatten(1)", nested);
+        assert!(flattened_once.unsupported_features.is_empty());
+        assert_eq!(
+            flattened_once.output.to_compact_string(),
+            "array<array<number> | number>"
+        );
+
+        let range = check("range(0; 3)", JType::Null);
+        assert!(range.unsupported_features.is_empty());
+        assert_eq!(
+            range.output.to_compact_string(),
+            "Stream<number, ZeroOrMore>"
+        );
+
+        let sin = check("sin", JType::number());
+        assert!(sin.unsupported_features.is_empty());
+        assert_eq!(sin.output.to_compact_string(), "number");
+
+        let numeric = check(
+            "{ cos: (1 | cos), ceil: (1.2 | ceil), pow: pow(2; 3), finite: (1 | isfinite), parts: (1.5 | modf), inf: infinite }",
+            JType::Null,
+        );
+        assert!(numeric.unsupported_features.is_empty());
+        let compact = numeric.output.to_compact_string();
+        assert!(compact.contains("cos: number"));
+        assert!(compact.contains("ceil: number"));
+        assert!(compact.contains("pow: number"));
+        assert!(compact.contains("finite: boolean"));
+        assert!(compact.contains("parts: array<number>"));
+        assert!(compact.contains("inf: number"));
     }
 
     #[test]

@@ -263,6 +263,59 @@ describe("analyzer — small cases", () => {
     expect(StreamType.toCompactString(joined.output)).toBe("string");
   });
 
+  it("flatten, range, and numeric builtins are analyzed", () => {
+    const nested = jsonSchemaToType({
+      type: "array",
+      items: {
+        anyOf: [
+          { type: "number" },
+          {
+            type: "array",
+            items: {
+              anyOf: [
+                { type: "number" },
+                { type: "array", items: { type: "number" } },
+              ],
+            },
+          },
+        ],
+      },
+    });
+
+    const flattened = check("flatten", nested);
+    expect(flattened.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(flattened.output)).toBe("array<number>");
+
+    const flattenedOnce = check("flatten(1)", nested);
+    expect(flattenedOnce.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(flattenedOnce.output)).toBe(
+      "array<array<number> | number>",
+    );
+
+    const range = check("range(0; 3)", "Null");
+    expect(range.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(range.output)).toBe(
+      "Stream<number, ZeroOrMore>",
+    );
+
+    const sin = check("sin", JType.number());
+    expect(sin.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(sin.output)).toBe("number");
+
+    const numeric = check(
+      "{ cos: (1 | cos), ceil: (1.2 | ceil), pow: pow(2; 3), finite: (1 | isfinite), parts: (1.5 | modf), inf: infinite }",
+      "Null",
+    );
+    expect(numeric.unsupported_features).toHaveLength(0);
+    const compact = StreamType.toCompactString(numeric.output);
+    expect(compact).toContain("cos: number");
+    expect(compact).toContain("ceil: number");
+    expect(compact).toContain("pow: number");
+    expect(compact).toContain("finite: boolean");
+    expect(compact).toContain("parts: array<number>");
+    expect(compact).toContain("inf: number");
+  });
+
   it("reports missing root property without cascading map diagnostic", () => {
     const input = jsonSchemaToType({
       type: "object",

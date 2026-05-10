@@ -175,6 +175,26 @@ fn cases() -> Vec<Case> {
         "additionalProperties": false
     });
 
+    let nested_numbers_schema = json!({
+        "type": "array",
+        "items": {
+            "anyOf": [
+                { "type": "number" },
+                {
+                    "type": "array",
+                    "items": {
+                        "anyOf": [
+                            { "type": "number" },
+                            { "type": "array", "items": { "type": "number" } }
+                        ]
+                    }
+                }
+            ]
+        }
+    });
+
+    let nested_numbers_sample = json!([1, [2, [3]], 4]);
+
     vec![
         Case {
             name: "identity",
@@ -343,6 +363,24 @@ fn cases() -> Vec<Case> {
             filter: "{ total: ([10, 20, 30] | add), joined: (.items | map(.id | tostring) | join(\",\")) }",
             input_schema: users_schema,
             inputs: vec![users_sample],
+        },
+        Case {
+            name: "flatten builtin",
+            filter: "flatten",
+            input_schema: nested_numbers_schema.clone(),
+            inputs: vec![nested_numbers_sample.clone(), json!([])],
+        },
+        Case {
+            name: "flatten depth builtin",
+            filter: "flatten(1)",
+            input_schema: nested_numbers_schema,
+            inputs: vec![nested_numbers_sample, json!([])],
+        },
+        Case {
+            name: "numeric math builtins",
+            filter: "{ cos: (1 | cos), ceil: (1.2 | ceil), pow: pow(2; 3), finite: (1 | isfinite), parts: (1.5 | modf), rangeSin: [range(0; 3) | sin] }",
+            input_schema: json!({}),
+            inputs: vec![json!(null), json!({"ignored": true})],
         },
     ]
 }

@@ -69,6 +69,82 @@ export interface JqtypeCapability {
   notes: string | null;
 }
 
+const NUMERIC_ZERO_ARG_BUILTINS = new Set([
+  "acos",
+  "acosh",
+  "asin",
+  "asinh",
+  "atan",
+  "atanh",
+  "cbrt",
+  "ceil",
+  "cos",
+  "cosh",
+  "erf",
+  "erfc",
+  "exp",
+  "exp10",
+  "exp2",
+  "expm1",
+  "fabs",
+  "floor",
+  "ilogb",
+  "infinite",
+  "j0",
+  "j1",
+  "lgamma",
+  "log",
+  "log10",
+  "log1p",
+  "log2",
+  "logb",
+  "nan",
+  "nearbyint",
+  "rint",
+  "round",
+  "sin",
+  "sinh",
+  "sqrt",
+  "tan",
+  "tanh",
+  "tgamma",
+  "trunc",
+  "y0",
+  "y1",
+]);
+
+const NUMERIC_PAIR_ZERO_ARG_BUILTINS = new Set(["frexp", "lgamma_r", "modf"]);
+
+const NUMERIC_PREDICATE_ZERO_ARG_BUILTINS = new Set([
+  "isfinite",
+  "isinfinite",
+  "isnan",
+  "isnormal",
+  "signbit",
+]);
+
+const NUMERIC_TWO_ARG_BUILTINS = new Set([
+  "atan2",
+  "copysign",
+  "fdim",
+  "fmax",
+  "fmin",
+  "fmod",
+  "hypot",
+  "jn",
+  "ldexp",
+  "nextafter",
+  "nexttoward",
+  "pow",
+  "remainder",
+  "scalb",
+  "scalbln",
+  "scalbn",
+  "yn",
+]);
+
+const NUMERIC_THREE_ARG_BUILTINS = new Set(["fma"]);
+
 export const JQTYPE_CAPABILITIES: JqtypeCapability[] = [
   { feature: "object constructors", status: "supported", notes: null },
   { feature: "array constructors", status: "supported", notes: null },
@@ -81,6 +157,9 @@ export const JQTYPE_CAPABILITIES: JqtypeCapability[] = [
   { feature: "type", status: "supported", notes: null },
   { feature: "tonumber", status: "supported", notes: null },
   { feature: "tostring", status: "supported", notes: null },
+  { feature: "flatten", status: "supported", notes: "Dynamic flatten depths are widened conservatively." },
+  { feature: "range", status: "supported", notes: null },
+  { feature: "numeric math builtins", status: "supported", notes: "Common jq/libm transforms, predicates, constants, and 2/3-argument numeric functions are modeled." },
   { feature: "object merge via +", status: "supported", notes: null },
   { feature: "identity-root updates", status: "partial", notes: "Literal fields, indexes, iterators, and string-like dynamic keys are modeled." },
   { feature: "external variables", status: "supported", notes: "Provide AnalyzeOptions.externalVars." },
@@ -876,7 +955,15 @@ class Analyzer {
     if (name === "length" && args.length === 0) return StreamType.one(JType.number());
     if (name === "tostring" && args.length === 0) return StreamType.one(tostringType(input));
     if (name === "tonumber" && args.length === 0) return StreamType.one(tonumberType(input));
-    if (name === "floor" && args.length === 0) return StreamType.one(JType.number());
+    if (args.length === 0 && NUMERIC_ZERO_ARG_BUILTINS.has(name)) {
+      return StreamType.one(JType.number());
+    }
+    if (args.length === 0 && NUMERIC_PAIR_ZERO_ARG_BUILTINS.has(name)) {
+      return StreamType.one(JType.array(JType.number()));
+    }
+    if (args.length === 0 && NUMERIC_PREDICATE_ZERO_ARG_BUILTINS.has(name)) {
+      return StreamType.one(JType.bool());
+    }
     if (name === "now" && args.length === 0) return StreamType.one(JType.number());
     if (name === "keys" && args.length === 0) return StreamType.one(this.keysType(input));
     if (name === "not" && args.length === 0) return StreamType.one(notType(input));
@@ -893,6 +980,25 @@ class Analyzer {
       return this.mapCall(args[0]!, input);
     }
     if (name === "add" && args.length === 0) return StreamType.one(this.addType(input));
+    if (name === "flatten" && args.length === 0) {
+      return StreamType.one(this.flattenType(input, { kind: "full" }));
+    }
+    if (name === "flatten" && args.length === 1) {
+      const depthType = this.analyze(args[0]!, input).item;
+      return StreamType.one(this.flattenType(input, flattenDepthFromType(depthType)));
+    }
+    if (name === "range" && args.length >= 1 && args.length <= 3) {
+      for (const arg of args) this.analyze(arg, input);
+      return StreamType.zeroOrMore(JType.number());
+    }
+    if (args.length === 2 && NUMERIC_TWO_ARG_BUILTINS.has(name)) {
+      for (const arg of args) this.analyze(arg, input);
+      return StreamType.one(JType.number());
+    }
+    if (args.length === 3 && NUMERIC_THREE_ARG_BUILTINS.has(name)) {
+      for (const arg of args) this.analyze(arg, input);
+      return StreamType.one(JType.number());
+    }
     if (name === "join" && args.length === 1) {
       this.analyze(args[0]!, input);
       return StreamType.one(JType.string());
@@ -1069,6 +1175,30 @@ class Analyzer {
     }
     this.warnOrError(
       `add may be applied to non-array input: ${JType.toCompactString(input)}`,
+    );
+    return "Unknown";
+  }
+
+  flattenType(input: JTypeT, depth: FlattenDepth): JTypeT {
+    if (typeof input === "object") {
+      if ("Array" in input) {
+        this.missingPathNull = false;
+        return JType.array(flattenItem(input.Array.items, depth));
+      }
+      if ("Union" in input) {
+        return JType.union(input.Union.map((item) => this.flattenType(item, depth)));
+      }
+    }
+    if (input === "Null" && this.missingPathNull) {
+      this.missingPathNull = false;
+      return "Unknown";
+    }
+    if (input === "Unknown") {
+      this.missingPathNull = false;
+      return JType.array("Unknown");
+    }
+    this.warnOrError(
+      `flatten may be applied to non-array input: ${JType.toCompactString(input)}`,
     );
     return "Unknown";
   }
@@ -1823,6 +1953,55 @@ function kindToType(kind: string): JTypeT {
     case "object": return JType.openObject({});
     default: return "Never";
   }
+}
+
+type FlattenDepth =
+  | { kind: "full" }
+  | { kind: "exact"; depth: number }
+  | { kind: "unknown" };
+
+function flattenDepthFromType(input: JTypeT): FlattenDepth {
+  if (typeof input === "object" && "Number" in input && input.Number !== "Any") {
+    const depth = Number(input.Number.Literal);
+    if (Number.isInteger(depth) && depth >= 0) return { kind: "exact", depth };
+  }
+  return { kind: "unknown" };
+}
+
+function flattenItem(input: JTypeT, depth: FlattenDepth): JTypeT {
+  if (depth.kind === "full") return flattenItemFull(input);
+  if (depth.kind === "exact") return flattenItemExact(input, depth.depth);
+  return flattenItemUnknownDepth(input);
+}
+
+function flattenItemFull(input: JTypeT): JTypeT {
+  if (typeof input === "object") {
+    if ("Array" in input) return flattenItemFull(input.Array.items);
+    if ("Union" in input) return JType.union(input.Union.map(flattenItemFull));
+  }
+  return input;
+}
+
+function flattenItemExact(input: JTypeT, depth: number): JTypeT {
+  if (depth === 0) return input;
+  if (typeof input === "object") {
+    if ("Array" in input) return flattenItemExact(input.Array.items, depth - 1);
+    if ("Union" in input) {
+      return JType.union(input.Union.map((item) => flattenItemExact(item, depth)));
+    }
+  }
+  return input;
+}
+
+function flattenItemUnknownDepth(input: JTypeT): JTypeT {
+  if (typeof input === "object") {
+    if ("Array" in input) {
+      const nested = input.Array.items;
+      return JType.union([JType.array(nested), flattenItemUnknownDepth(nested)]);
+    }
+    if ("Union" in input) return JType.union(input.Union.map(flattenItemUnknownDepth));
+  }
+  return input;
 }
 
 function flattenUnion(input: JTypeT): JTypeT[] {

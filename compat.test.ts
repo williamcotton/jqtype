@@ -182,6 +182,26 @@ const hourlyWeatherSchema = {
   additionalProperties: false,
 };
 
+const nestedNumbersSchema = {
+  type: "array",
+  items: {
+    anyOf: [
+      { type: "number" },
+      {
+        type: "array",
+        items: {
+          anyOf: [
+            { type: "number" },
+            { type: "array", items: { type: "number" } },
+          ],
+        },
+      },
+    ],
+  },
+};
+
+const nestedNumbersSample = [1, [2, [3]], 4];
+
 const cases: Case[] = [
   {
     name: "identity",
@@ -352,6 +372,25 @@ const cases: Case[] = [
     filter: '{ total: ([10, 20, 30] | add), joined: (.items | map(.id | tostring) | join(",")) }',
     inputSchema: usersSchema,
     inputs: [usersSample],
+  },
+  {
+    name: "flatten builtin",
+    filter: "flatten",
+    inputSchema: nestedNumbersSchema,
+    inputs: [nestedNumbersSample, []],
+  },
+  {
+    name: "flatten depth builtin",
+    filter: "flatten(1)",
+    inputSchema: nestedNumbersSchema,
+    inputs: [nestedNumbersSample, []],
+  },
+  {
+    name: "numeric math builtins",
+    filter:
+      "{ cos: (1 | cos), ceil: (1.2 | ceil), pow: pow(2; 3), finite: (1 | isfinite), parts: (1.5 | modf), rangeSin: [range(0; 3) | sin] }",
+    inputSchema: {},
+    inputs: [null, { ignored: true }],
   },
 ];
 

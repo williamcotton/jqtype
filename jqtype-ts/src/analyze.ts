@@ -361,6 +361,7 @@ class Analyzer {
   defCallDepth = new Map<string, number>();
   readonly maxDefDepth = 4;
   missingPathNull = false;
+  altLhsDepth = 0;
 
   constructor(options: ResolvedAnalyzeOptions, source: string) {
     this.options = options;
@@ -741,6 +742,8 @@ class Analyzer {
         }
         if (optional) {
           this.missingPathNull = false;
+        } else if (this.altLhsDepth > 0) {
+          this.missingPathNull = true;
         } else {
           this.missingPathNull = true;
           this.warnOrError(
@@ -969,7 +972,9 @@ class Analyzer {
       );
     }
     if (op === "//") {
+      this.altLhsDepth += 1;
       const left = this.analyze(node.left, input);
+      this.altLhsDepth -= 1;
       const right = this.analyze(node.right, input);
       return StreamType.new(
         altType(left.item, right.item),
@@ -1488,6 +1493,19 @@ class Analyzer {
         const leftLit = literalTypeFilter(expr.left);
         if (rightField !== null && leftLit !== null) {
           return refineFieldLiteralPredicate(input, rightField, leftLit, op);
+        }
+        const lengthMatch =
+          recognizeLengthPredicate(expr.left, expr.right, op) ??
+          recognizeLengthPredicate(expr.right, expr.left, flipOrd(op));
+        if (lengthMatch !== null) {
+          return refineFieldEmptiness(input, lengthMatch.field, lengthMatch.kind);
+        }
+      } else if (op === ">" || op === ">=" || op === "<" || op === "<=") {
+        const lengthMatch =
+          recognizeLengthPredicate(expr.left, expr.right, op) ??
+          recognizeLengthPredicate(expr.right, expr.left, flipOrd(op));
+        if (lengthMatch !== null) {
+          return refineFieldEmptiness(input, lengthMatch.field, lengthMatch.kind);
         }
       } else if (op === "and") {
         const left = this.analyzePredicate(expr.left, input);
@@ -2493,6 +2511,168 @@ function refineFieldLiteralPredicate(
   const eq = refineFieldEquals(input, field, literal);
   if (op === "==") return eq;
   return { whenTrue: eq.whenFalse, whenFalse: eq.whenTrue };
+}
+
+type OrdOp = "==" | "!=" | ">" | ">=" | "<" | "<=";
+type LengthKind = "Empty" | "NonEmpty";
+
+function isLengthCall(expr: ExpressionAst): boolean {
+  return (
+    expr.type === "filter" &&
+    filterIdent(expr.name) === "length" &&
+    expr.args.length === 0
+  );
+}
+
+function isEmptyDefaultLiteral(expr: ExpressionAst): boolean {
+  if (expr.type === "array" && expr.expr === undefined) return true;
+  if (expr.type === "object" && expr.entries.length === 0) return true;
+  if (expr.type === "str") {
+    const s = literalString(expr);
+    return s !== null && s.length === 0;
+  }
+  return false;
+}
+
+function lengthOfFieldPattern(expr: ExpressionAst): string | null {
+  if (expr.type !== "binary" || expr.operator !== "|") return null;
+  if (!isLengthCall(expr.right)) return null;
+  const direct = topLevelFieldAccess(expr.left);
+  if (direct !== null) return direct;
+  if (expr.left.type !== "binary" || expr.left.operator !== "//") return null;
+  const field = topLevelFieldAccess(expr.left.left);
+  if (field === null) return null;
+  if (!isEmptyDefaultLiteral(expr.left.right)) return null;
+  return field;
+}
+
+function literalI64Filter(expr: ExpressionAst): number | null {
+  if (expr.type === "num" && Number.isInteger(expr.value)) return expr.value;
+  if (expr.type === "unary" && expr.operator === "-" && expr.expr.type === "num") {
+    const v = expr.expr.value;
+    if (Number.isInteger(v)) return -v;
+  }
+  return null;
+}
+
+function lengthPredicateKind(op: OrdOp, literal: number): LengthKind | null {
+  if (op === "==" && literal === 0) return "Empty";
+  if (op === "!=" && literal === 0) return "NonEmpty";
+  if (op === ">" && literal === 0) return "NonEmpty";
+  if (op === ">=" && literal === 1) return "NonEmpty";
+  if (op === "<" && literal === 1) return "Empty";
+  if (op === "<=" && literal === 0) return "Empty";
+  return null;
+}
+
+function flipOrd(op: OrdOp): OrdOp {
+  switch (op) {
+    case ">":
+      return "<";
+    case ">=":
+      return "<=";
+    case "<":
+      return ">";
+    case "<=":
+      return ">=";
+    default:
+      return op;
+  }
+}
+
+function recognizeLengthPredicate(
+  left: ExpressionAst,
+  right: ExpressionAst,
+  op: OrdOp,
+): { field: string; kind: LengthKind } | null {
+  const field = lengthOfFieldPattern(left);
+  if (field === null) return null;
+  const lit = literalI64Filter(right);
+  if (lit === null) return null;
+  const kind = lengthPredicateKind(op, lit);
+  if (kind === null) return null;
+  return { field, kind };
+}
+
+function isFieldDefinitelyMissing(member: JTypeT, field: string): boolean {
+  if (typeof member !== "object" || !("Object" in member)) return false;
+  return member.Object.properties[field] === undefined && member.Object.additional === null;
+}
+
+type Emptiness = "Empty" | "NonEmpty" | "Unknown";
+
+function classifyValueEmptiness(ty: JTypeT): Emptiness {
+  if (ty === "Null") return "Empty";
+  if (typeof ty === "object") {
+    if ("Array" in ty) {
+      return ty.Array.items === "Never" ? "Empty" : "Unknown";
+    }
+    if ("String" in ty) {
+      if (ty.String === "Any") return "Unknown";
+      return ty.String.Literal.length === 0 ? "Empty" : "NonEmpty";
+    }
+    if ("Object" in ty) {
+      const obj = ty.Object;
+      if (Object.keys(obj.properties).length === 0 && obj.additional === null) {
+        return "Empty";
+      }
+      return "Unknown";
+    }
+  }
+  return "Unknown";
+}
+
+type PartitionClass = "EmptyOnly" | "NonEmptyOnly" | "Both";
+
+function classifyForPartition(
+  member: JTypeT,
+  field: string,
+  anyMissing: boolean,
+): PartitionClass {
+  if (typeof member !== "object" || !("Object" in member)) return "Both";
+  const obj = member.Object;
+  const prop = obj.properties[field];
+  if (prop === undefined) {
+    return obj.additional !== null ? "Both" : "EmptyOnly";
+  }
+  if (!prop.required) return "Both";
+  switch (classifyValueEmptiness(prop.ty)) {
+    case "Empty":
+      return "EmptyOnly";
+    case "NonEmpty":
+      return "NonEmptyOnly";
+    case "Unknown":
+      return anyMissing ? "NonEmptyOnly" : "Both";
+  }
+}
+
+function refineFieldEmptiness(
+  input: JTypeT,
+  field: string,
+  trueKind: LengthKind,
+): PredicateRefinement {
+  const members = flattenUnion(input);
+  const anyMissing = members.some((m) => isFieldDefinitelyMissing(m, field));
+
+  const empties: JTypeT[] = [];
+  const nonEmpties: JTypeT[] = [];
+  for (const member of members) {
+    const klass = classifyForPartition(member, field, anyMissing);
+    if (klass === "EmptyOnly") empties.push(member);
+    else if (klass === "NonEmptyOnly") nonEmpties.push(member);
+    else {
+      empties.push(member);
+      nonEmpties.push(member);
+    }
+  }
+
+  const whenEmpty = JType.union(empties);
+  const whenNonEmpty = JType.union(nonEmpties);
+
+  if (trueKind === "Empty") {
+    return { whenTrue: whenEmpty, whenFalse: whenNonEmpty };
+  }
+  return { whenTrue: whenNonEmpty, whenFalse: whenEmpty };
 }
 
 function refineTypePredicate(

@@ -316,6 +316,7 @@ struct Analyzer {
     def_call_depth: BTreeMap<String, usize>,
     max_def_depth: usize,
     missing_path_null: bool,
+    alt_lhs_depth: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -336,6 +337,7 @@ impl Analyzer {
             def_call_depth: BTreeMap::new(),
             max_def_depth: 4,
             missing_path_null: false,
+            alt_lhs_depth: 0,
         }
     }
 
@@ -652,7 +654,9 @@ impl Analyzer {
                 )
             }
             BinaryOp::Alt => {
+                self.alt_lhs_depth += 1;
                 let left = self.analyze(left, input.clone());
+                self.alt_lhs_depth -= 1;
                 let right = self.analyze(right, input);
                 StreamType::new(
                     alt_type(left.item, right.item),
@@ -1117,6 +1121,22 @@ impl Analyzer {
                     (top_level_field_access(right), literal_type_filter(left))
                 {
                     return self.refine_field_literal_predicate(input, &field, literal, *op);
+                }
+                if let Some((field, kind)) = recognize_length_predicate(left, right, *op)
+                    .or_else(|| recognize_length_predicate(right, left, flip_ord(*op)))
+                {
+                    return refine_field_emptiness(input, &field, kind);
+                }
+            }
+            Filter::Binary(
+                left,
+                BinaryOp::Ord(op @ (OrdOp::Gt | OrdOp::Ge | OrdOp::Lt | OrdOp::Le)),
+                right,
+            ) => {
+                if let Some((field, kind)) = recognize_length_predicate(left, right, *op)
+                    .or_else(|| recognize_length_predicate(right, left, flip_ord(*op)))
+                {
+                    return refine_field_emptiness(input, &field, kind);
                 }
             }
             Filter::Binary(left, BinaryOp::And, right) => {
@@ -1622,6 +1642,8 @@ impl Analyzer {
                 } else {
                     if optional {
                         self.missing_path_null = false;
+                    } else if self.alt_lhs_depth > 0 {
+                        self.missing_path_null = true;
                     } else {
                         self.warn_or_error(
                             format!(
@@ -2529,6 +2551,176 @@ fn top_level_field_access(filter: &SpannedFilter) -> Option<String> {
     literal_string_filter(index)
 }
 
+#[derive(Clone, Copy)]
+enum LengthKind {
+    Empty,
+    NonEmpty,
+}
+
+#[derive(Clone, Copy)]
+enum Emptiness {
+    Empty,
+    NonEmpty,
+    Unknown,
+}
+
+#[derive(Clone, Copy)]
+enum PartitionClass {
+    EmptyOnly,
+    NonEmptyOnly,
+    Both,
+}
+
+fn is_length_call(filter: &SpannedFilter) -> bool {
+    matches!(&filter.0, Filter::Call(name, args) if name == "length" && args.is_empty())
+}
+
+fn is_empty_default_literal(filter: &SpannedFilter) -> bool {
+    match &filter.0 {
+        Filter::Array(None) => true,
+        Filter::Object(items) if items.is_empty() => true,
+        Filter::Str(value) => matches!(literal_string(value), Some(s) if s.is_empty()),
+        _ => false,
+    }
+}
+
+fn length_of_field_pattern(filter: &SpannedFilter) -> Option<String> {
+    let Filter::Binary(left, BinaryOp::Pipe(None), right) = &filter.0 else {
+        return None;
+    };
+    if !is_length_call(right) {
+        return None;
+    }
+    if let Some(field) = top_level_field_access(left) {
+        return Some(field);
+    }
+    let Filter::Binary(alt_left, BinaryOp::Alt, alt_right) = &left.0 else {
+        return None;
+    };
+    let field = top_level_field_access(alt_left)?;
+    if !is_empty_default_literal(alt_right) {
+        return None;
+    }
+    Some(field)
+}
+
+fn length_predicate_kind(op: OrdOp, literal: i64) -> Option<LengthKind> {
+    match (op, literal) {
+        (OrdOp::Eq, 0) => Some(LengthKind::Empty),
+        (OrdOp::Ne, 0) => Some(LengthKind::NonEmpty),
+        (OrdOp::Gt, 0) => Some(LengthKind::NonEmpty),
+        (OrdOp::Ge, 1) => Some(LengthKind::NonEmpty),
+        (OrdOp::Lt, 1) => Some(LengthKind::Empty),
+        (OrdOp::Le, 0) => Some(LengthKind::Empty),
+        _ => None,
+    }
+}
+
+fn flip_ord(op: OrdOp) -> OrdOp {
+    match op {
+        OrdOp::Gt => OrdOp::Lt,
+        OrdOp::Ge => OrdOp::Le,
+        OrdOp::Lt => OrdOp::Gt,
+        OrdOp::Le => OrdOp::Ge,
+        OrdOp::Eq => OrdOp::Eq,
+        OrdOp::Ne => OrdOp::Ne,
+    }
+}
+
+fn recognize_length_predicate(
+    left: &SpannedFilter,
+    right: &SpannedFilter,
+    op: OrdOp,
+) -> Option<(String, LengthKind)> {
+    let field = length_of_field_pattern(left)?;
+    let lit = literal_i64_filter(right)?;
+    let kind = length_predicate_kind(op, lit)?;
+    Some((field, kind))
+}
+
+fn is_field_definitely_missing(member: &JType, field: &str) -> bool {
+    matches!(member, JType::Object(obj)
+        if !obj.properties.contains_key(field) && obj.additional.is_none())
+}
+
+fn classify_value_emptiness(ty: &JType) -> Emptiness {
+    match ty {
+        JType::Null => Emptiness::Empty,
+        JType::Array(arr) if matches!(*arr.items, JType::Never) => Emptiness::Empty,
+        JType::String(StringType::Literal(s)) if s.is_empty() => Emptiness::Empty,
+        JType::String(StringType::Literal(_)) => Emptiness::NonEmpty,
+        JType::Object(obj) if obj.properties.is_empty() && obj.additional.is_none() => {
+            Emptiness::Empty
+        }
+        _ => Emptiness::Unknown,
+    }
+}
+
+fn classify_for_partition(member: &JType, field: &str, any_missing: bool) -> PartitionClass {
+    let JType::Object(obj) = member else {
+        return PartitionClass::Both;
+    };
+    match obj.properties.get(field) {
+        None => {
+            if obj.additional.is_some() {
+                PartitionClass::Both
+            } else {
+                PartitionClass::EmptyOnly
+            }
+        }
+        Some(prop) => {
+            if !prop.required {
+                return PartitionClass::Both;
+            }
+            match classify_value_emptiness(&prop.ty) {
+                Emptiness::Empty => PartitionClass::EmptyOnly,
+                Emptiness::NonEmpty => PartitionClass::NonEmptyOnly,
+                Emptiness::Unknown => {
+                    if any_missing {
+                        PartitionClass::NonEmptyOnly
+                    } else {
+                        PartitionClass::Both
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn refine_field_emptiness(input: JType, field: &str, true_kind: LengthKind) -> PredicateRefinement {
+    let members = flatten_union(input);
+    let any_missing = members
+        .iter()
+        .any(|m| is_field_definitely_missing(m, field));
+
+    let mut empties = Vec::new();
+    let mut non_empties = Vec::new();
+    for member in members {
+        match classify_for_partition(&member, field, any_missing) {
+            PartitionClass::EmptyOnly => empties.push(member),
+            PartitionClass::NonEmptyOnly => non_empties.push(member),
+            PartitionClass::Both => {
+                empties.push(member.clone());
+                non_empties.push(member);
+            }
+        }
+    }
+
+    let when_empty = JType::union(empties);
+    let when_non_empty = JType::union(non_empties);
+
+    match true_kind {
+        LengthKind::Empty => PredicateRefinement {
+            when_true: when_empty,
+            when_false: when_non_empty,
+        },
+        LengthKind::NonEmpty => PredicateRefinement {
+            when_true: when_non_empty,
+            when_false: when_empty,
+        },
+    }
+}
+
 fn refine_has_predicate(input: JType, key: &str) -> PredicateRefinement {
     match input {
         JType::Object(mut object) => {
@@ -3385,6 +3577,429 @@ mod tests {
         );
         assert!(report.diagnostics[0].span.is_some());
         assert_eq!(report.output.to_compact_string(), "array<null>");
+    }
+
+    #[test]
+    fn alt_lhs_suppresses_missing_property_warning() {
+        let input = json_schema_to_type(&json!({
+            "type": "object",
+            "properties": {
+                "launches": {
+                    "type": "array",
+                    "items": { "type": "number" }
+                }
+            },
+            "required": ["launches"],
+            "additionalProperties": false
+        }));
+
+        let report = check(r#".query.status // "all""#, input);
+        assert!(
+            report.diagnostics.is_empty(),
+            "expected no diagnostics, got: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.output.to_compact_string(), "\"all\"");
+    }
+
+    #[test]
+    fn alt_lhs_chained_paths_suppress_all_missing_warnings() {
+        let input = json_schema_to_type(&json!({
+            "type": "object",
+            "properties": {
+                "launches": {
+                    "type": "array",
+                    "items": { "type": "number" }
+                }
+            },
+            "required": ["launches"],
+            "additionalProperties": false
+        }));
+
+        let report = check(r#".query.status // .status // "all""#, input);
+        assert!(
+            report.diagnostics.is_empty(),
+            "expected no diagnostics, got: {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn alt_lhs_nested_alts_keep_suppression() {
+        let input = json_schema_to_type(&json!({
+            "type": "object",
+            "properties": {
+                "x": { "type": "string" }
+            },
+            "required": ["x"],
+            "additionalProperties": false
+        }));
+
+        let report = check(r#"(.a.b // .c.d) // "fallback""#, input);
+        assert!(
+            report.diagnostics.is_empty(),
+            "expected no diagnostics, got: {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn alt_rhs_still_warns_for_missing_property() {
+        let input = json_schema_to_type(&json!({
+            "type": "object",
+            "properties": {
+                "x": { "type": "string" }
+            },
+            "required": ["x"],
+            "additionalProperties": false
+        }));
+
+        let report = check(r#""default" // .missing"#, input);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert!(
+            report.diagnostics[0]
+                .message
+                .contains("property \"missing\" is not present")
+        );
+    }
+
+    #[test]
+    fn outside_alt_still_warns_for_missing_property() {
+        let input = json_schema_to_type(&json!({
+            "type": "object",
+            "properties": {
+                "x": { "type": "string" }
+            },
+            "required": ["x"],
+            "additionalProperties": false
+        }));
+
+        let report = check(r#"(.a // "x") + .b"#, input);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert!(
+            report.diagnostics[0]
+                .message
+                .contains("property \"b\" is not present")
+        );
+    }
+
+    fn launch_error_union_schema() -> serde_json::Value {
+        json!({
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "errors": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "type": { "type": "string" },
+                                    "message": { "type": "string" }
+                                },
+                                "required": ["type", "message"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["errors"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "launch": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "number" },
+                                "name": { "type": "string" }
+                            },
+                            "required": ["id", "name"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "required": ["launch"],
+                    "additionalProperties": false
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn if_length_gt_zero_narrows_union_into_present_field_member() {
+        let input = json_schema_to_type(&launch_error_union_schema());
+
+        let report = check(
+            "if ((.errors // []) | length) > 0 then .errors[0] else .launch end",
+            input,
+        );
+        assert!(
+            report.diagnostics.is_empty(),
+            "expected no diagnostics, got: {:?}",
+            report.diagnostics
+        );
+        let compact = report.output.to_compact_string();
+        // Then branch refines to the {errors} member, so .errors[0] is Err | null
+        // (array indexing); else branch refines to the {launch} member, so .launch
+        // is the launch object. Together: Err | null | launch_object.
+        assert!(
+            compact.contains("type: string"),
+            "expected error item shape in {compact}",
+        );
+        assert!(
+            compact.contains("id: number"),
+            "expected launch shape in {compact}",
+        );
+    }
+
+    #[test]
+    fn if_length_eq_zero_narrows_to_absent_or_empty() {
+        let input = json_schema_to_type(&launch_error_union_schema());
+
+        let report = check(
+            "if ((.errors // []) | length) == 0 then .launch else .errors end",
+            input,
+        );
+        assert!(
+            report.diagnostics.is_empty(),
+            "expected no diagnostics, got: {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn length_not_eq_zero_behaves_like_gt_zero() {
+        let input = json_schema_to_type(&launch_error_union_schema());
+
+        let report = check(
+            "if ((.errors // []) | length) != 0 then .errors else .launch end",
+            input,
+        );
+        assert!(
+            report.diagnostics.is_empty(),
+            "expected no diagnostics, got: {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn length_predicate_without_alt_default_still_narrows() {
+        let input = json_schema_to_type(&launch_error_union_schema());
+
+        // No `// []` default. The pattern should still be recognized for
+        // narrowing purposes.
+        let report = check(
+            "if (.errors | length) > 0 then .errors else .launch end",
+            input,
+        );
+        assert!(
+            report.diagnostics.is_empty(),
+            "expected no diagnostics, got: {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn length_predicate_only_narrows_when_field_disambiguates() {
+        // Single union member that has BOTH fields. Predicate cannot disambiguate
+        // (there are no other members where errors is missing). No narrowing.
+        let input = json_schema_to_type(&json!({
+            "type": "object",
+            "properties": {
+                "errors": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                },
+                "launch": {
+                    "type": "object",
+                    "properties": { "id": { "type": "number" } },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }
+            },
+            "required": ["errors", "launch"],
+            "additionalProperties": false
+        }));
+
+        let report = check(
+            "if (.errors | length) > 0 then .launch else .launch end",
+            input,
+        );
+        // .launch is present on the single member, so this should not warn.
+        assert!(
+            report.diagnostics.is_empty(),
+            "expected no diagnostics, got: {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn length_predicate_n_other_than_zero_or_one_does_not_narrow() {
+        let input = json_schema_to_type(&launch_error_union_schema());
+
+        // `length > 5` is not a recognized partition; falls through to generic.
+        let report = check(
+            "if (.errors | length) > 5 then .errors else .launch end",
+            input,
+        );
+        // Both branches see the full union, so .launch on the {errors} member
+        // emits a missing-property warning.
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("property \"launch\" is not present")),
+            "expected missing-launch warning, got: {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn alt_default_string_or_object_recognized() {
+        // String default.
+        let input = json_schema_to_type(&json!({
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } },
+                    "required": ["text"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": { "other": { "type": "number" } },
+                    "required": ["other"],
+                    "additionalProperties": false
+                }
+            ]
+        }));
+        let report = check(
+            r#"if ((.text // "") | length) > 0 then .text else .other end"#,
+            input,
+        );
+        assert!(
+            report.diagnostics.is_empty(),
+            "expected no diagnostics (string default), got: {:?}",
+            report.diagnostics
+        );
+
+        // Object default.
+        let input = json_schema_to_type(&json!({
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "bag": {
+                            "type": "object",
+                            "properties": { "k": { "type": "string" } },
+                            "required": ["k"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "required": ["bag"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": { "other": { "type": "number" } },
+                    "required": ["other"],
+                    "additionalProperties": false
+                }
+            ]
+        }));
+        let report = check(
+            "if ((.bag // {}) | length) > 0 then .bag else .other end",
+            input,
+        );
+        assert!(
+            report.diagnostics.is_empty(),
+            "expected no diagnostics (object default), got: {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn webpipe_repro_launch_detail_else_branch() {
+        let input = json_schema_to_type(&json!({
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "errors": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "type": { "type": "string" },
+                                    "message": { "type": "string" }
+                                },
+                                "required": ["type", "message"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["errors"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "launch": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "number" },
+                                "slug": { "type": "string" },
+                                "name": { "type": "string" }
+                            },
+                            "required": ["id", "slug", "name"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "required": ["launch"],
+                    "additionalProperties": false
+                }
+            ]
+        }));
+
+        let report = check(
+            "if ((.errors // []) | length) > 0 then { errors: .errors } else .launch as $launch | { launch: $launch } end",
+            input,
+        );
+        assert!(
+            report.diagnostics.is_empty(),
+            "expected no diagnostics, got: {:?}",
+            report.diagnostics
+        );
+        let compact = report.output.to_compact_string();
+        assert!(
+            !compact.contains("null"),
+            "expected no null in output, got: {compact}",
+        );
+    }
+
+    #[test]
+    fn alt_lhs_still_reports_unrelated_type_errors() {
+        // `.x` is a string; `.x.k` is "field may be applied to non-object".
+        // That is not a missing-property warning, so the `//` LHS gating
+        // must not suppress it.
+        let input = json_schema_to_type(&json!({
+            "type": "object",
+            "properties": {
+                "x": { "type": "string" }
+            },
+            "required": ["x"],
+            "additionalProperties": false
+        }));
+
+        let report = check(r#".x.k // "ok""#, input);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("may be applied to non-object")),
+            "expected non-object access warning, got: {:?}",
+            report.diagnostics
+        );
     }
 
     #[test]

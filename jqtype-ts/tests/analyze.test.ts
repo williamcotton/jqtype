@@ -375,6 +375,314 @@ describe("analyzer — small cases", () => {
     expect(StreamType.toCompactString(r.output)).toBe("array<null>");
   });
 
+  it("alt LHS suppresses missing property warning", () => {
+    const input = jsonSchemaToType({
+      type: "object",
+      properties: {
+        launches: {
+          type: "array",
+          items: { type: "number" },
+        },
+      },
+      required: ["launches"],
+      additionalProperties: false,
+    });
+
+    const r = check('.query.status // "all"', input);
+    expect(r.diagnostics).toHaveLength(0);
+    expect(StreamType.toCompactString(r.output)).toBe('"all"');
+  });
+
+  it("alt LHS chained paths suppress all missing warnings", () => {
+    const input = jsonSchemaToType({
+      type: "object",
+      properties: {
+        launches: {
+          type: "array",
+          items: { type: "number" },
+        },
+      },
+      required: ["launches"],
+      additionalProperties: false,
+    });
+
+    const r = check('.query.status // .status // "all"', input);
+    expect(r.diagnostics).toHaveLength(0);
+  });
+
+  it("alt LHS nested alts keep suppression", () => {
+    const input = jsonSchemaToType({
+      type: "object",
+      properties: { x: { type: "string" } },
+      required: ["x"],
+      additionalProperties: false,
+    });
+
+    const r = check('(.a.b // .c.d) // "fallback"', input);
+    expect(r.diagnostics).toHaveLength(0);
+  });
+
+  it("alt RHS still warns for missing property", () => {
+    const input = jsonSchemaToType({
+      type: "object",
+      properties: { x: { type: "string" } },
+      required: ["x"],
+      additionalProperties: false,
+    });
+
+    const r = check('"default" // .missing', input);
+    expect(r.diagnostics).toHaveLength(1);
+    expect(r.diagnostics[0]?.message).toContain(
+      'property "missing" is not present',
+    );
+  });
+
+  it("outside alt still warns for missing property", () => {
+    const input = jsonSchemaToType({
+      type: "object",
+      properties: { x: { type: "string" } },
+      required: ["x"],
+      additionalProperties: false,
+    });
+
+    const r = check('(.a // "x") + .b', input);
+    expect(r.diagnostics).toHaveLength(1);
+    expect(r.diagnostics[0]?.message).toContain('property "b" is not present');
+  });
+
+  it("alt LHS still reports unrelated type errors", () => {
+    const input = jsonSchemaToType({
+      type: "object",
+      properties: { x: { type: "string" } },
+      required: ["x"],
+      additionalProperties: false,
+    });
+
+    const r = check('.x.k // "ok"', input);
+    expect(
+      r.diagnostics.some((d) => d.message.includes("may be applied to non-object")),
+    ).toBe(true);
+  });
+
+  const launchErrorUnionSchema = {
+    anyOf: [
+      {
+        type: "object" as const,
+        properties: {
+          errors: {
+            type: "array" as const,
+            items: {
+              type: "object" as const,
+              properties: {
+                type: { type: "string" as const },
+                message: { type: "string" as const },
+              },
+              required: ["type", "message"],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ["errors"],
+        additionalProperties: false,
+      },
+      {
+        type: "object" as const,
+        properties: {
+          launch: {
+            type: "object" as const,
+            properties: {
+              id: { type: "number" as const },
+              name: { type: "string" as const },
+            },
+            required: ["id", "name"],
+            additionalProperties: false,
+          },
+        },
+        required: ["launch"],
+        additionalProperties: false,
+      },
+    ],
+  };
+
+  it("if length > 0 narrows union into present-field member", () => {
+    const input = jsonSchemaToType(launchErrorUnionSchema);
+
+    const r = check(
+      "if ((.errors // []) | length) > 0 then .errors[0] else .launch end",
+      input,
+    );
+    expect(r.diagnostics).toHaveLength(0);
+    const compact = StreamType.toCompactString(r.output);
+    expect(compact).toContain("type: string");
+    expect(compact).toContain("id: number");
+  });
+
+  it("if length == 0 narrows to absent-or-empty", () => {
+    const input = jsonSchemaToType(launchErrorUnionSchema);
+    const r = check(
+      "if ((.errors // []) | length) == 0 then .launch else .errors end",
+      input,
+    );
+    expect(r.diagnostics).toHaveLength(0);
+  });
+
+  it("length != 0 behaves like > 0", () => {
+    const input = jsonSchemaToType(launchErrorUnionSchema);
+    const r = check(
+      "if ((.errors // []) | length) != 0 then .errors else .launch end",
+      input,
+    );
+    expect(r.diagnostics).toHaveLength(0);
+  });
+
+  it("length predicate without // default still narrows", () => {
+    const input = jsonSchemaToType(launchErrorUnionSchema);
+    const r = check(
+      "if (.errors | length) > 0 then .errors else .launch end",
+      input,
+    );
+    expect(r.diagnostics).toHaveLength(0);
+  });
+
+  it("length predicate only narrows when field disambiguates", () => {
+    const input = jsonSchemaToType({
+      type: "object",
+      properties: {
+        errors: {
+          type: "array",
+          items: { type: "string" },
+        },
+        launch: {
+          type: "object",
+          properties: { id: { type: "number" } },
+          required: ["id"],
+          additionalProperties: false,
+        },
+      },
+      required: ["errors", "launch"],
+      additionalProperties: false,
+    });
+    const r = check(
+      "if (.errors | length) > 0 then .launch else .launch end",
+      input,
+    );
+    expect(r.diagnostics).toHaveLength(0);
+  });
+
+  it("length predicate with n other than 0 or 1 does not narrow", () => {
+    const input = jsonSchemaToType(launchErrorUnionSchema);
+    const r = check(
+      "if (.errors | length) > 5 then .errors else .launch end",
+      input,
+    );
+    expect(
+      r.diagnostics.some((d) => d.message.includes('property "launch" is not present')),
+    ).toBe(true);
+  });
+
+  it("alt default string or object recognized", () => {
+    const stringInput = jsonSchemaToType({
+      anyOf: [
+        {
+          type: "object",
+          properties: { text: { type: "string" } },
+          required: ["text"],
+          additionalProperties: false,
+        },
+        {
+          type: "object",
+          properties: { other: { type: "number" } },
+          required: ["other"],
+          additionalProperties: false,
+        },
+      ],
+    });
+    const r1 = check(
+      'if ((.text // "") | length) > 0 then .text else .other end',
+      stringInput,
+    );
+    expect(r1.diagnostics).toHaveLength(0);
+
+    const objectInput = jsonSchemaToType({
+      anyOf: [
+        {
+          type: "object",
+          properties: {
+            bag: {
+              type: "object",
+              properties: { k: { type: "string" } },
+              required: ["k"],
+              additionalProperties: false,
+            },
+          },
+          required: ["bag"],
+          additionalProperties: false,
+        },
+        {
+          type: "object",
+          properties: { other: { type: "number" } },
+          required: ["other"],
+          additionalProperties: false,
+        },
+      ],
+    });
+    const r2 = check(
+      "if ((.bag // {}) | length) > 0 then .bag else .other end",
+      objectInput,
+    );
+    expect(r2.diagnostics).toHaveLength(0);
+  });
+
+  it("webpipe repro launchDetail else branch", () => {
+    const input = jsonSchemaToType({
+      anyOf: [
+        {
+          type: "object",
+          properties: {
+            errors: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  type: { type: "string" },
+                  message: { type: "string" },
+                },
+                required: ["type", "message"],
+                additionalProperties: false,
+              },
+            },
+          },
+          required: ["errors"],
+          additionalProperties: false,
+        },
+        {
+          type: "object",
+          properties: {
+            launch: {
+              type: "object",
+              properties: {
+                id: { type: "number" },
+                slug: { type: "string" },
+                name: { type: "string" },
+              },
+              required: ["id", "slug", "name"],
+              additionalProperties: false,
+            },
+          },
+          required: ["launch"],
+          additionalProperties: false,
+        },
+      ],
+    });
+    const r = check(
+      "if ((.errors // []) | length) > 0 then { errors: .errors } else .launch as $launch | { launch: $launch } end",
+      input,
+    );
+    expect(r.diagnostics).toHaveLength(0);
+    const compact = StreamType.toCompactString(r.output);
+    expect(compact).not.toContain("null");
+  });
+
   it("slices and interpolation are analyzed", () => {
     const input = jsonSchemaToType({
       type: "object",

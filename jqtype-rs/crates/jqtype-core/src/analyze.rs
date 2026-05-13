@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use jaq_syn::filter::{AssignOp, BinaryOp, Filter as JaqFilter, FoldType, KeyVal};
 use jaq_syn::path::{Opt, Part};
@@ -259,7 +259,7 @@ impl JqTypeChecker {
             None
         };
 
-        let mut analyzer = Analyzer::new(options);
+        let mut analyzer = Analyzer::new(options, source, &filter);
         let output = analyzer.analyze_main(&filter, input.into_type());
         AnalyzeReport {
             output,
@@ -308,6 +308,7 @@ struct DefEntry {
 
 struct Analyzer {
     options: AnalyzeOptions,
+    source_spans: AnalyzerSourceSpans,
     diagnostics: Vec<Diagnostic>,
     unsupported_features: Vec<UnsupportedFeature>,
     env: BTreeMap<String, JType>,
@@ -319,6 +320,250 @@ struct Analyzer {
     alt_lhs_depth: usize,
 }
 
+#[derive(Default)]
+struct AnalyzerSourceSpans {
+    filters: HashMap<usize, Span>,
+    strings: HashMap<usize, Span>,
+}
+
+fn filter_key(filter: &SpannedFilter) -> usize {
+    filter as *const SpannedFilter as usize
+}
+
+fn string_key(value: &jaq_syn::Str<SpannedFilter>) -> usize {
+    value as *const jaq_syn::Str<SpannedFilter> as usize
+}
+
+fn collect_source_spans(source: &str, main: &Main) -> AnalyzerSourceSpans {
+    let mut collector = SourceSpanCollector::new(source);
+    collector.collect_main(main);
+    collector.spans
+}
+
+// jaq-syn exposes spans, but for some jq path forms they can cover the whole
+// source. Build a lightweight source-order overlay for diagnostics.
+struct SourceSpanCollector<'a> {
+    source: &'a str,
+    cursor: usize,
+    spans: AnalyzerSourceSpans,
+}
+
+impl<'a> SourceSpanCollector<'a> {
+    fn new(source: &'a str) -> Self {
+        Self {
+            source,
+            cursor: 0,
+            spans: AnalyzerSourceSpans::default(),
+        }
+    }
+
+    fn collect_main(&mut self, main: &Main) {
+        for def in &main.defs {
+            self.collect_def(def);
+        }
+        self.visit_filter(&main.body);
+    }
+
+    fn collect_def(&mut self, def: &Def) {
+        let _ = self.find_token("def");
+        let _ = self.find_token(&def.lhs.name);
+        for arg in &def.lhs.args {
+            match arg {
+                Arg::Var(name) => {
+                    let _ = self.find_token(&format!("${name}"));
+                }
+                Arg::Fun(name) => {
+                    let _ = self.find_token(name);
+                }
+            }
+        }
+        self.collect_main(&def.rhs);
+    }
+
+    fn visit_filter(&mut self, filter: &SpannedFilter) {
+        match &filter.0 {
+            Filter::Id | Filter::Recurse => {}
+            Filter::Num(value) => {
+                self.record_filter(filter, value);
+            }
+            Filter::Str(value) => {
+                self.record_string(value);
+                if let Some(span) = self.spans.strings.get(&string_key(value)).cloned() {
+                    self.spans.filters.insert(filter_key(filter), span);
+                }
+            }
+            Filter::Array(Some(inner)) => self.visit_filter(inner),
+            Filter::Array(None) => {}
+            Filter::Object(items) => {
+                for item in items {
+                    self.visit_object_item(item);
+                }
+            }
+            Filter::Path(base, path) => {
+                if !matches!(base.0, Filter::Id) || path.is_empty() {
+                    self.visit_filter(base);
+                }
+                for (part, _) in path {
+                    self.visit_path_part(part);
+                }
+            }
+            Filter::Binary(left, op, right) => {
+                self.visit_filter(left);
+                let _ = self.find_token(binary_op_token(op));
+                self.visit_filter(right);
+            }
+            Filter::Ite(branches, else_branch) => {
+                for (condition, then_branch) in branches {
+                    self.visit_filter(condition);
+                    self.visit_filter(then_branch);
+                }
+                if let Some(else_branch) = else_branch {
+                    self.visit_filter(else_branch);
+                }
+            }
+            Filter::Call(name, args) => {
+                self.record_filter(filter, name);
+                for arg in args {
+                    self.visit_filter(arg);
+                }
+            }
+            Filter::Try(inner) => self.visit_filter(inner),
+            Filter::TryCatch(inner, catch) => {
+                self.visit_filter(inner);
+                if let Some(catch) = catch {
+                    self.visit_filter(catch);
+                }
+            }
+            Filter::Neg(inner) => {
+                let _ = self.find_token("-");
+                self.visit_filter(inner);
+            }
+            Filter::Var(name) => {
+                self.record_filter(filter, &format!("${name}"));
+            }
+            Filter::Fold(_, fold) => {
+                self.visit_filter(&fold.xs);
+                let _ = self.find_token(&format!("${}", fold.x));
+                self.visit_filter(&fold.init);
+                self.visit_filter(&fold.f);
+            }
+        }
+    }
+
+    fn visit_object_item(&mut self, item: &KeyVal<SpannedFilter>) {
+        match item {
+            KeyVal::Filter(key_filter, value_filter) => {
+                self.visit_filter(key_filter);
+                self.visit_filter(value_filter);
+            }
+            KeyVal::Str(key, value_filter) => {
+                self.record_string(key);
+                if let Some(value_filter) = value_filter {
+                    self.visit_filter(value_filter);
+                }
+            }
+        }
+    }
+
+    fn visit_path_part(&mut self, part: &Part<SpannedFilter>) {
+        match part {
+            Part::Index(index) => {
+                if let Some(key) = literal_string_filter(index) {
+                    let span = self.find_property(&key);
+                    if let Some(span) = span {
+                        self.spans.filters.insert(filter_key(index), span);
+                    }
+                } else {
+                    self.visit_filter(index);
+                }
+            }
+            Part::Range(from, to) => {
+                if let Some(from) = from {
+                    self.visit_filter(from);
+                }
+                if let Some(to) = to {
+                    self.visit_filter(to);
+                }
+            }
+        }
+    }
+
+    fn record_filter(&mut self, filter: &SpannedFilter, token: &str) {
+        if let Some(span) = self.find_token(token) {
+            self.spans.filters.insert(filter_key(filter), span);
+        }
+    }
+
+    fn record_string(&mut self, value: &jaq_syn::Str<SpannedFilter>) {
+        if let Some(literal) = literal_string(value) {
+            if let Some(span) = self.find_string_literal(&literal) {
+                self.spans.strings.insert(string_key(value), span);
+            }
+            return;
+        }
+
+        let _ = self.find_token("\"");
+        for part in &value.parts {
+            if let string::Part::Fun(filter) = part {
+                self.visit_filter(filter);
+            }
+        }
+    }
+
+    fn find_property(&mut self, key: &str) -> Option<Span> {
+        self.find_token(&format!(".{key}"))
+            .or_else(|| self.find_token(key))
+    }
+
+    fn find_string_literal(&mut self, value: &str) -> Option<Span> {
+        let token = serde_json::to_string(value).ok()?;
+        let start = self.source.get(self.cursor..)?.find(&token)? + self.cursor;
+        self.cursor = start + token.len();
+        if token.len() >= 2 {
+            Some(start + 1..start + token.len() - 1)
+        } else {
+            Some(start..start + token.len())
+        }
+    }
+
+    fn find_token(&mut self, token: &str) -> Option<Span> {
+        if token.is_empty() {
+            return None;
+        }
+        let start = self.source.get(self.cursor..)?.find(token)? + self.cursor;
+        self.cursor = start + token.len();
+        Some(start..self.cursor)
+    }
+}
+
+fn binary_op_token(op: &BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Pipe(_) => "|",
+        BinaryOp::Comma => ",",
+        BinaryOp::Alt => "//",
+        BinaryOp::Or => "or",
+        BinaryOp::And => "and",
+        BinaryOp::Math(MathOp::Add) => "+",
+        BinaryOp::Math(MathOp::Sub) => "-",
+        BinaryOp::Math(MathOp::Mul) => "*",
+        BinaryOp::Math(MathOp::Div) => "/",
+        BinaryOp::Math(MathOp::Rem) => "%",
+        BinaryOp::Assign(AssignOp::Assign) => "=",
+        BinaryOp::Assign(AssignOp::Update) => "|=",
+        BinaryOp::Assign(AssignOp::UpdateWith(MathOp::Add)) => "+=",
+        BinaryOp::Assign(AssignOp::UpdateWith(MathOp::Sub)) => "-=",
+        BinaryOp::Assign(AssignOp::UpdateWith(MathOp::Mul)) => "*=",
+        BinaryOp::Assign(AssignOp::UpdateWith(MathOp::Div)) => "/=",
+        BinaryOp::Assign(AssignOp::UpdateWith(MathOp::Rem)) => "%=",
+        BinaryOp::Ord(OrdOp::Eq) => "==",
+        BinaryOp::Ord(OrdOp::Ne) => "!=",
+        BinaryOp::Ord(OrdOp::Lt) => "<",
+        BinaryOp::Ord(OrdOp::Le) => "<=",
+        BinaryOp::Ord(OrdOp::Gt) => ">",
+        BinaryOp::Ord(OrdOp::Ge) => ">=",
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PredicateRefinement {
     when_true: JType,
@@ -326,8 +571,9 @@ struct PredicateRefinement {
 }
 
 impl Analyzer {
-    fn new(options: AnalyzeOptions) -> Self {
+    fn new(options: AnalyzeOptions, source: &str, main: &Main) -> Self {
         Self {
+            source_spans: collect_source_spans(source, main),
             options,
             diagnostics: Vec::new(),
             unsupported_features: Vec::new(),
@@ -339,6 +585,22 @@ impl Analyzer {
             missing_path_null: false,
             alt_lhs_depth: 0,
         }
+    }
+
+    fn span_for_filter(&self, filter: &SpannedFilter) -> Span {
+        self.source_spans
+            .filters
+            .get(&filter_key(filter))
+            .cloned()
+            .unwrap_or_else(|| filter.1.clone())
+    }
+
+    fn span_for_string(&self, value: &jaq_syn::Str<SpannedFilter>, fallback: Span) -> Span {
+        self.source_spans
+            .strings
+            .get(&string_key(value))
+            .cloned()
+            .unwrap_or(fallback)
     }
 
     fn analyze_main(&mut self, main: &Main, input: JType) -> StreamType {
@@ -441,7 +703,7 @@ impl Analyzer {
     }
 
     fn analyze(&mut self, filter: &SpannedFilter, input: JType) -> StreamType {
-        let span = filter.1.clone();
+        let span = self.span_for_filter(filter);
         match &filter.0 {
             Filter::Id => StreamType::one(input),
             Filter::Num(value) => StreamType::one(JType::number_lit(value.clone())),
@@ -510,11 +772,12 @@ impl Analyzer {
                         });
                     }
                 }
-                KeyVal::Str(key, value_filter) => {
-                    if let Some(key) = literal_string(key) {
+                KeyVal::Str(key_filter, value_filter) => {
+                    if let Some(key) = literal_string(key_filter) {
+                        let span = self.span_for_string(key_filter, 0..0);
                         let value = match value_filter {
                             Some(value_filter) => self.analyze(value_filter, input.clone()).item,
-                            None => self.access_field(input.clone(), &key, false, 0..0).item,
+                            None => self.access_field(input.clone(), &key, false, span).item,
                         };
                         properties.insert(
                             key,
@@ -558,17 +821,13 @@ impl Analyzer {
     ) -> StreamType {
         match part {
             Part::Index(index) => {
+                let span = self.span_for_filter(index);
                 if let Some(key) = literal_string_filter(index) {
-                    self.access_field(input, &key, matches!(opt, Opt::Optional), index.1.clone())
+                    self.access_field(input, &key, matches!(opt, Opt::Optional), span)
                 } else if let Some(index) = literal_i64_filter(index) {
-                    self.access_index(
-                        input,
-                        index,
-                        matches!(opt, Opt::Optional),
-                        index_span(index),
-                    )
+                    self.access_index(input, index, matches!(opt, Opt::Optional), span)
                 } else {
-                    self.access_dynamic_index(input, matches!(opt, Opt::Optional), index.1.clone())
+                    self.access_dynamic_index(input, matches!(opt, Opt::Optional), span)
                 }
             }
             Part::Range(None, None) => self.iterate(input, matches!(opt, Opt::Optional), 0..0),
@@ -1928,13 +2187,14 @@ impl Analyzer {
 
         match &head.0 {
             Part::Index(index) => {
+                let span = self.span_for_filter(index);
                 if let Some(key) = literal_string_filter(index) {
-                    self.write_field(input, &key, rest, value, index.1.clone())
+                    self.write_field(input, &key, rest, value, span)
                 } else if literal_i64_filter(index).is_some() {
-                    self.write_array_index(input, rest, value, index.1.clone())
+                    self.write_array_index(input, rest, value, span)
                 } else {
                     let key_type = self.analyze(index, input.clone()).item;
-                    self.write_dynamic_index(input, key_type, rest, value, index.1.clone())
+                    self.write_dynamic_index(input, key_type, rest, value, span)
                 }
             }
             Part::Range(None, None) => self.write_array_index(input, rest, value, span),
@@ -3170,10 +3430,6 @@ fn flatten_union(input: JType) -> Vec<JType> {
     }
 }
 
-fn index_span(_index: i64) -> Span {
-    0..0
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -3660,6 +3916,109 @@ mod tests {
             report.diagnostics[0]
                 .message
                 .contains("property \"missing\" is not present")
+        );
+    }
+
+    #[test]
+    fn repeated_property_access_uses_correct_span() {
+        let input = json_schema_to_type(&json!({
+            "type": "object",
+            "properties": {
+                "params": {
+                    "type": "object",
+                    "properties": { "id": { "type": "string" } },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }
+            },
+            "required": ["params"],
+            "additionalProperties": false
+        }));
+        let filter = ".params.id // .id";
+        let report = check(filter, input);
+        let diagnostic = report
+            .diagnostics
+            .iter()
+            .find(|diag| diag.message.contains("property \"id\" is not present"))
+            .expect("missing property diagnostic");
+        let span = diagnostic.span.clone().expect("diagnostic span");
+
+        assert_eq!(span, SourceSpan::new(14, 17));
+        assert_eq!(&filter[span.start..span.end], ".id");
+    }
+
+    #[test]
+    fn multiple_failing_accesses_get_distinct_spans() {
+        let filter = ".foo + .foo";
+        let report = check(filter, JType::closed_object(BTreeMap::new()));
+        let spans: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|diag| diag.message.contains("property \"foo\" is not present"))
+            .map(|diag| diag.span.clone())
+            .collect();
+
+        assert_eq!(
+            spans,
+            vec![Some(SourceSpan::new(0, 4)), Some(SourceSpan::new(7, 11))]
+        );
+    }
+
+    #[test]
+    fn unicode_source_prefixes_do_not_shift_repeated_access_spans() {
+        let filter = "\"é\", .foo + .foo";
+        let report = check(filter, JType::closed_object(BTreeMap::new()));
+        let first = filter.find(".foo").unwrap();
+        let second = filter.rfind(".foo").unwrap();
+        let spans: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|diag| diag.message.contains("property \"foo\" is not present"))
+            .map(|diag| diag.span.clone())
+            .collect();
+
+        assert_eq!(
+            spans,
+            vec![
+                Some(SourceSpan::new(first, first + 4)),
+                Some(SourceSpan::new(second, second + 4))
+            ]
+        );
+    }
+
+    #[test]
+    fn predicate_analysis_keeps_repeated_access_spans_stable() {
+        let filter = "if (.a | not) then .a else .b end";
+        let report = check(filter, JType::closed_object(BTreeMap::new()));
+        let spans: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|diag| diag.message.contains("property \"a\" is not present"))
+            .map(|diag| diag.span.clone())
+            .collect();
+
+        assert_eq!(
+            spans,
+            vec![Some(SourceSpan::new(4, 6)), Some(SourceSpan::new(19, 21))]
+        );
+    }
+
+    #[test]
+    fn branches_with_repeated_keys_report_each_branch_location() {
+        let mut props = BTreeMap::new();
+        props.insert("flag".to_string(), JType::property(JType::bool(), true));
+        let filter = "if .flag then .a else .a end";
+        let report = check(filter, JType::closed_object(props));
+        let spans: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|diag| diag.message.contains("property \"a\" is not present"))
+            .map(|diag| diag.span.clone())
+            .collect();
+
+        assert_eq!(
+            spans,
+            vec![Some(SourceSpan::new(14, 16)), Some(SourceSpan::new(22, 24))]
         );
     }
 

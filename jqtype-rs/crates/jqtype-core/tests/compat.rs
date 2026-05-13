@@ -304,6 +304,12 @@ fn cases() -> Vec<Case> {
             inputs: vec![json!({"params": {"id": "42"}})],
         },
         Case {
+            name: "alternative fallback with repeated key",
+            filter: ".params.id // .id",
+            input_schema: route_params_schema.clone(),
+            inputs: vec![json!({"params": {"id": "42"}})],
+        },
+        Case {
             name: "identity-root assignment",
             filter: ".graphqlParams = { id: 1 }",
             input_schema: route_params_schema,

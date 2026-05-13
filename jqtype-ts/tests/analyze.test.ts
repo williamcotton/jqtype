@@ -785,6 +785,85 @@ describe("analyzer — small cases", () => {
     expect(unbound.diagnostics[0]?.span).toEqual({ start: 0, end: 8 });
   });
 
+  it("repeated property access uses the failing access span", () => {
+    const input = jsonSchemaToType({
+      type: "object",
+      properties: {
+        params: {
+          type: "object",
+          properties: { id: { type: "string" } },
+          required: ["id"],
+          additionalProperties: false,
+        },
+      },
+      required: ["params"],
+      additionalProperties: false,
+    });
+    const filter = ".params.id // .id";
+    const r = check(filter, input);
+    const diagnostic = r.diagnostics.find((d) =>
+      d.message.includes('property "id" is not present'),
+    );
+
+    expect(diagnostic?.span).toEqual({ start: 14, end: 17 });
+    expect(filter.slice(diagnostic!.span!.start, diagnostic!.span!.end)).toBe(".id");
+  });
+
+  it("multiple failing accesses get distinct spans", () => {
+    const filter = ".foo + .foo";
+    const r = check(filter, JType.closedObject({}));
+    const spans = r.diagnostics
+      .filter((d) => d.message.includes('property "foo" is not present'))
+      .map((d) => d.span);
+
+    expect(spans).toEqual([
+      { start: 0, end: 4 },
+      { start: 7, end: 11 },
+    ]);
+  });
+
+  it("unicode source prefixes do not shift repeated access spans", () => {
+    const filter = "\"é\", .foo + .foo";
+    const r = check(filter, JType.closedObject({}));
+    const spans = r.diagnostics
+      .filter((d) => d.message.includes('property "foo" is not present'))
+      .map((d) => d.span);
+
+    expect(spans).toEqual([
+      { start: filter.indexOf(".foo"), end: filter.indexOf(".foo") + 4 },
+      { start: filter.lastIndexOf(".foo"), end: filter.lastIndexOf(".foo") + 4 },
+    ]);
+  });
+
+  it("predicate analysis keeps repeated access spans stable", () => {
+    const filter = "if (.a | not) then .a else .b end";
+    const r = check(filter, JType.closedObject({}));
+    const spans = r.diagnostics
+      .filter((d) => d.message.includes('property "a" is not present'))
+      .map((d) => d.span);
+
+    expect(spans).toEqual([
+      { start: 4, end: 6 },
+      { start: 19, end: 21 },
+    ]);
+  });
+
+  it("branches with repeated keys report each branch location", () => {
+    const input = JType.closedObject({
+      flag: JType.property(JType.bool(), true),
+    });
+    const filter = "if .flag then .a else .a end";
+    const r = check(filter, input);
+    const spans = r.diagnostics
+      .filter((d) => d.message.includes('property "a" is not present'))
+      .map((d) => d.span);
+
+    expect(spans).toEqual([
+      { start: 14, end: 16 },
+      { start: 22, end: 24 },
+    ]);
+  });
+
   it("unsupported builtin produces a warning", () => {
     const r = check("not_a_real_builtin", JType.array("Unknown"));
     expect(StreamType.toCompactString(r.output)).toBe("unknown");

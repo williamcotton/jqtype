@@ -30,6 +30,7 @@ import {
   type ArrayDestructuringAst,
   type DefAst,
   type ArgAst,
+  type FilterAst,
 } from "./parser.js";
 
 interface FilterArgBinding {
@@ -284,7 +285,7 @@ export class JqTypeChecker {
         ? JSON.stringify(parsed.ast, null, 2)
         : null;
 
-    const analyzer = new Analyzer(resolvedOptions, source);
+    const analyzer = new Analyzer(resolvedOptions, source, parsed.ast);
     const inputTy = InputShape.intoType(input);
     const output = analyzer.analyzeProg(parsed.ast, inputTy);
     return {
@@ -349,9 +350,227 @@ function offsetFromLineColumn(source: string, line: number, column: number): num
   return Math.min(source.length, offset + Math.max(0, column));
 }
 
+interface AnalyzerSourceSpans {
+  expr: WeakMap<object, SourceSpan>;
+  index: WeakMap<IndexAst, SourceSpan>;
+  binaryOperator: WeakMap<object, SourceSpan>;
+  objectEntryKey: WeakMap<object, SourceSpan>;
+}
+
+function collectSourceSpans(source: string, prog: ProgAst): AnalyzerSourceSpans {
+  const collector = new SourceSpanCollector(source);
+  collector.collect(prog);
+  return collector.spans;
+}
+
+// @jq-tools/jq does not expose source offsets, so build a lightweight span
+// overlay by walking the parser AST in source order and matching tokens forward.
+class SourceSpanCollector {
+  readonly spans: AnalyzerSourceSpans = {
+    expr: new WeakMap<object, SourceSpan>(),
+    index: new WeakMap<IndexAst, SourceSpan>(),
+    binaryOperator: new WeakMap<object, SourceSpan>(),
+    objectEntryKey: new WeakMap<object, SourceSpan>(),
+  };
+
+  private cursor = 0;
+
+  constructor(private readonly source: string) {}
+
+  collect(prog: ProgAst): void {
+    if (prog.expr !== undefined) this.visitExpression(prog.expr);
+  }
+
+  private visitExpression(expr: ExpressionAst): void {
+    switch (expr.type) {
+      case "identity":
+      case "bool":
+      case "null":
+      case "num":
+      case "format":
+      case "recursiveDescent":
+        return;
+      case "str":
+        this.recordString(expr);
+        return;
+      case "var":
+        this.recordExpr(expr, `$${normalizeVarName(expr.name)}`);
+        return;
+      case "array":
+        if (expr.expr !== undefined) this.visitExpression(expr.expr);
+        return;
+      case "object":
+        for (const entry of expr.entries) this.visitObjectEntry(entry);
+        return;
+      case "index": {
+        this.visitExpression(expr.expr);
+        let span: SourceSpan | null = null;
+        if (typeof expr.index === "string") {
+          span = this.findProperty(expr.index);
+        } else {
+          this.visitExpression(expr.index);
+          span = this.spans.expr.get(expr.index) ?? null;
+        }
+        if (span !== null) this.spans.index.set(expr, span);
+        return;
+      }
+      case "iterator":
+        this.visitExpression(expr.expr);
+        return;
+      case "slice":
+        this.visitExpression(expr.expr);
+        if (expr.from !== undefined) this.visitExpression(expr.from);
+        if (expr.to !== undefined) this.visitExpression(expr.to);
+        return;
+      case "binary": {
+        this.visitExpression(expr.left);
+        const span = this.findToken(expr.operator);
+        if (span !== null) this.spans.binaryOperator.set(expr, span);
+        this.visitExpression(expr.right);
+        return;
+      }
+      case "if":
+        this.visitExpression(expr.cond);
+        this.visitExpression(expr.then);
+        for (const elif of expr.elifs ?? []) {
+          this.visitExpression(elif.cond);
+          this.visitExpression(elif.then);
+        }
+        if (expr.else !== undefined) this.visitExpression(expr.else);
+        return;
+      case "filter":
+        this.recordExpr(expr, filterIdent(expr.name));
+        for (const arg of expr.args) this.visitExpression(arg);
+        return;
+      case "try":
+        this.visitExpression(expr.body);
+        if (expr.catch !== undefined) this.visitExpression(expr.catch);
+        return;
+      case "unary":
+        this.visitExpression(expr.expr);
+        return;
+      case "varDeclaration":
+        this.visitExpression(expr.expr);
+        for (const pattern of expr.destructuring) this.visitDestructuring(pattern);
+        this.visitExpression(expr.next);
+        return;
+      case "reduce":
+        this.visitExpression(expr.expr);
+        this.findToken(`$${normalizeVarName(expr.var)}`);
+        this.visitExpression(expr.init);
+        this.visitExpression(expr.update);
+        return;
+      case "foreach":
+        this.visitExpression(expr.expr);
+        this.findToken(`$${normalizeVarName(expr.var)}`);
+        this.visitExpression(expr.init);
+        this.visitExpression(expr.update);
+        if (expr.extract !== undefined) this.visitExpression(expr.extract);
+        return;
+      case "def":
+        this.visitDef(expr);
+        return;
+      case "label":
+        this.recordExpr(expr, "label");
+        this.findToken(`$${normalizeVarName(expr.value)}`);
+        this.visitExpression(expr.next);
+        return;
+      case "break":
+        this.recordExpr(expr, "break");
+        this.findToken(`$${normalizeVarName(expr.value)}`);
+        return;
+    }
+  }
+
+  private visitObjectEntry(entry: ObjectEntryAst): void {
+    const keySpan = this.consumeObjectKey(entry.key);
+    if (keySpan !== null) this.spans.objectEntryKey.set(entry, keySpan);
+    if (entry.value !== undefined) this.visitExpression(entry.value);
+  }
+
+  private consumeObjectKey(key: ObjectEntryAst["key"]): SourceSpan | null {
+    if (typeof key === "string") return this.findToken(key);
+    this.visitExpression(key);
+    return this.spans.expr.get(key) ?? null;
+  }
+
+  private visitDef(expr: DefAst): void {
+    this.findToken("def");
+    this.findToken(filterIdent(expr.name));
+    for (const arg of expr.args) {
+      if (arg.type === "varArg") this.findToken(`$${normalizeVarName(arg.name)}`);
+      else this.findToken(filterIdent(arg.name));
+    }
+    this.visitExpression(expr.body);
+    if (expr.next !== undefined) this.visitExpression(expr.next);
+  }
+
+  private visitDestructuring(pattern: DestructuringAst): void {
+    if (pattern.type === "var") {
+      this.findToken(`$${normalizeVarName(pattern.name)}`);
+      return;
+    }
+    if (pattern.type === "arrayDestructuring") {
+      for (const child of pattern.destructuring) this.visitDestructuring(child);
+      return;
+    }
+    for (const entry of pattern.entries) {
+      if (typeof entry.key === "string") this.findToken(entry.key);
+      else this.visitExpression(entry.key);
+      if (entry.destructuring !== undefined) this.visitDestructuring(entry.destructuring);
+    }
+  }
+
+  private recordExpr(expr: object, token: string): SourceSpan | null {
+    const span = this.findToken(token);
+    if (span !== null) this.spans.expr.set(expr, span);
+    return span;
+  }
+
+  private recordString(expr: StrAst): void {
+    if (expr.interpolated === false) {
+      const span = this.findStringLiteral(expr.value);
+      if (span !== null) this.spans.expr.set(expr, span);
+      return;
+    }
+
+    const quote = this.source.indexOf("\"", this.cursor);
+    if (quote >= 0) this.cursor = quote + 1;
+    for (const part of expr.parts) {
+      if (typeof part !== "string") this.visitExpression(part);
+    }
+  }
+
+  private findProperty(key: string): SourceSpan | null {
+    return this.findToken(`.${key}`) ?? this.findToken(key);
+  }
+
+  private findStringLiteral(value: string): SourceSpan | null {
+    const token = JSON.stringify(value);
+    const start = this.source.indexOf(token, this.cursor);
+    if (start >= 0) {
+      this.cursor = start + token.length;
+      return token.length >= 2
+        ? { start: start + 1, end: start + token.length - 1 }
+        : { start, end: start + token.length };
+    }
+    return this.findToken(value);
+  }
+
+  private findToken(token: string): SourceSpan | null {
+    if (token.length === 0) return null;
+    const start = this.source.indexOf(token, this.cursor);
+    if (start < 0) return null;
+    this.cursor = start + token.length;
+    return { start, end: this.cursor };
+  }
+}
+
 class Analyzer {
   options: ResolvedAnalyzeOptions;
   source: string;
+  sourceSpans: AnalyzerSourceSpans;
+  spanCursors = new Map<string, number>();
   diagnostics: Diagnostic[] = [];
   unsupportedFeatures: UnsupportedFeature[] = [];
   env = new Map<string, JTypeT>();
@@ -363,9 +582,10 @@ class Analyzer {
   missingPathNull = false;
   altLhsDepth = 0;
 
-  constructor(options: ResolvedAnalyzeOptions, source: string) {
+  constructor(options: ResolvedAnalyzeOptions, source: string, prog: ProgAst) {
     this.options = options;
     this.source = source;
+    this.sourceSpans = collectSourceSpans(source, prog);
     for (const [name, ty] of Object.entries(options.externalVars)) {
       this.env.set(normalizeVarName(name), ty);
     }
@@ -404,7 +624,7 @@ class Analyzer {
       case "if":
         return this.analyzeIf(expr, input);
       case "filter":
-        return this.analyzeCall(expr.name, expr.args, input);
+        return this.analyzeCall(expr, input);
       case "try":
         return this.analyzeTry(expr, input);
       case "unary":
@@ -417,7 +637,7 @@ class Analyzer {
           return this.unsupported(
             `unbound jq variable: $${name}`,
             "Unknown",
-            this.spanForToken(`$${name}`),
+            this.spanForExpr(expr) ?? this.spanForToken(`$${name}`),
           );
         }
       case "varDeclaration":
@@ -439,7 +659,7 @@ class Analyzer {
         return this.unsupported(
           "labels and break are not supported yet",
           input,
-          this.spanForToken(expr.type),
+          this.spanForExpr(expr) ?? this.spanForToken(expr.type),
         );
       case "format":
         return StreamType.one(JType.string());
@@ -453,7 +673,12 @@ class Analyzer {
     for (const entry of entries) {
       if (entry.value === undefined) {
         if (typeof entry.key === "string") {
-          const value = this.accessField(input, entry.key, false).item;
+          const value = this.accessField(
+            input,
+            entry.key,
+            false,
+            this.spanForObjectEntryKey(entry) ?? this.spanForProperty(entry.key),
+          ).item;
           properties[entry.key] = { ty: value, required: true };
         } else {
           additional = "Unknown";
@@ -691,7 +916,7 @@ class Analyzer {
     optional: boolean,
   ): StreamType {
     const inner = this.analyze(node.expr, input);
-    const part = this.indexOp(inner.item, node.index, optional);
+    const part = this.indexOp(inner.item, node.index, optional, this.spanForIndex(node));
     return StreamType.new(part.item, Cardinality.compose(inner.card, part.card));
   }
 
@@ -715,18 +940,28 @@ class Analyzer {
     return StreamType.new(part.item, Cardinality.compose(inner.card, part.card));
   }
 
-  indexOp(input: JTypeT, index: string | ExpressionAst, optional: boolean): StreamType {
-    if (typeof index === "string") return this.accessField(input, index, optional);
+  indexOp(
+    input: JTypeT,
+    index: string | ExpressionAst,
+    optional: boolean,
+    span: SourceSpan | null = null,
+  ): StreamType {
+    if (typeof index === "string") return this.accessField(input, index, optional, span);
     if (index.type === "num") {
       return this.accessIndex(input, optional);
     }
     if (index.type === "str" && index.interpolated === false) {
-      return this.accessField(input, index.value, optional);
+      return this.accessField(input, index.value, optional, span ?? this.spanForExpr(index));
     }
     return this.accessDynamicIndex(input, optional);
   }
 
-  accessField(input: JTypeT, key: string, optional: boolean): StreamType {
+  accessField(
+    input: JTypeT,
+    key: string,
+    optional: boolean,
+    span: SourceSpan | null = null,
+  ): StreamType {
     if (typeof input === "object") {
       if ("Object" in input) {
         const prop = input.Object.properties[key];
@@ -748,7 +983,7 @@ class Analyzer {
           this.missingPathNull = true;
           this.warnOrError(
             `property "${key}" is not present on ${JType.toCompactString(input)}`,
-            this.spanForProperty(key),
+            span ?? this.spanForProperty(key),
           );
         }
         return StreamType.one("Null");
@@ -756,7 +991,7 @@ class Analyzer {
       if ("Union" in input) {
         let out = StreamType.zero();
         for (const item of input.Union) {
-          out = StreamType.join(out, this.accessField(item, key, optional));
+          out = StreamType.join(out, this.accessField(item, key, optional, span));
         }
         return out;
       }
@@ -771,12 +1006,14 @@ class Analyzer {
       this.missingPathNull = false;
       this.warnOrError(
         `optional field \`${key}\` skipped non-object input: ${JType.toCompactString(input)}`,
+        span ?? this.spanForProperty(key),
       );
       return StreamType.zero();
     }
     this.missingPathNull = false;
     this.warnOrError(
       `field \`${key}\` may be applied to non-object input: ${JType.toCompactString(input)}`,
+      span ?? this.spanForProperty(key),
     );
     return StreamType.one("Unknown");
   }
@@ -996,7 +1233,7 @@ class Analyzer {
     return this.unsupported(
       `unsupported binary operator \`${op}\``,
       "Unknown",
-      this.spanForToken(op),
+      this.spanForBinaryOperator(node) ?? this.spanForToken(op),
     );
   }
 
@@ -1082,7 +1319,9 @@ class Analyzer {
     return StreamType.one(JType.number());
   }
 
-  analyzeCall(rawName: string, args: ExpressionAst[], input: JTypeT): StreamType {
+  analyzeCall(node: FilterAst, input: JTypeT): StreamType {
+    const rawName = node.name;
+    const args = node.args;
     // Parser passes "name/arity" — keep it for def/filterArg lookup; strip for builtin matching
     const defEntry = this.defs.get(rawName);
     if (defEntry !== undefined) {
@@ -1359,7 +1598,7 @@ class Analyzer {
     return this.unsupported(
       `unsupported builtin or call \`${name}\``,
       "Unknown",
-      this.spanForToken(name),
+      this.spanForExpr(node) ?? this.spanForToken(name),
     );
   }
 
@@ -1892,10 +2131,34 @@ class Analyzer {
     );
   }
 
+  spanForExpr(expr: object): SourceSpan | null {
+    return this.sourceSpans.expr.get(expr) ?? null;
+  }
+
+  spanForIndex(node: IndexAst): SourceSpan | null {
+    return this.sourceSpans.index.get(node) ?? null;
+  }
+
+  spanForBinaryOperator(node: object): SourceSpan | null {
+    return this.sourceSpans.binaryOperator.get(node) ?? null;
+  }
+
+  spanForObjectEntryKey(entry: object): SourceSpan | null {
+    return this.sourceSpans.objectEntryKey.get(entry) ?? null;
+  }
+
   spanForToken(token: string): SourceSpan | null {
     if (token.length === 0) return null;
-    const start = this.source.indexOf(token);
-    if (start < 0) return null;
+    const from = this.spanCursors.get(token) ?? 0;
+    const start = this.source.indexOf(token, from);
+    if (start < 0) {
+      this.spanCursors.set(token, 0);
+      const retry = this.source.indexOf(token);
+      if (retry < 0) return null;
+      this.spanCursors.set(token, retry + token.length);
+      return { start: retry, end: retry + token.length };
+    }
+    this.spanCursors.set(token, start + token.length);
     return { start, end: start + token.length };
   }
 

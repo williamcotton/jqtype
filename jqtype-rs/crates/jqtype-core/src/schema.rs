@@ -226,11 +226,8 @@ fn number_eq(actual: &Number, expected: &str) -> bool {
 fn object_fits(value: &Map<String, Value>, object: &ObjectType) -> bool {
     for (key, prop) in &object.properties {
         match value.get(key) {
-            Some(actual) => {
-                if !value_fits_type(actual, &prop.ty) {
-                    return false;
-                }
-            }
+            Some(actual) if !value_fits_type(actual, &prop.ty) => return false,
+            Some(_) => {}
             None if prop.required => return false,
             None => {}
         }

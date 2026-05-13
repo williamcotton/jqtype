@@ -309,6 +309,12 @@ const cases: Case[] = [
     inputs: [{ params: { id: "42" } }],
   },
   {
+    name: "alternative fallback with repeated key",
+    filter: ".params.id // .id",
+    inputSchema: routeParamsSchema,
+    inputs: [{ params: { id: "42" } }],
+  },
+  {
     name: "identity-root assignment",
     filter: ".graphqlParams = { id: 1 }",
     inputSchema: routeParamsSchema,

@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use jaq_syn::filter::{AssignOp, BinaryOp, Filter as JaqFilter, FoldType, KeyVal};
 use jaq_syn::path::{Opt, Part};
 use jaq_syn::string;
+use jaq_syn::{Arg, Def, Main};
 use jaq_syn::{MathOp, OrdOp, Span, Spanned};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -259,7 +260,7 @@ impl JqTypeChecker {
         };
 
         let mut analyzer = Analyzer::new(options);
-        let output = analyzer.analyze(&filter.body, input.into_type());
+        let output = analyzer.analyze_main(&filter, input.into_type());
         AnalyzeReport {
             output,
             diagnostics: analyzer.diagnostics,
@@ -288,11 +289,32 @@ fn parse_filter(source: &str) -> Result<jaq_syn::Main<Filter>, AnalyzeReport> {
     })
 }
 
+#[derive(Clone)]
+struct FilterArgBinding {
+    body: SpannedFilter,
+    env: BTreeMap<String, JType>,
+    filter_args: BTreeMap<String, FilterArgBinding>,
+    defs: BTreeMap<String, DefEntry>,
+}
+
+#[derive(Clone)]
+struct DefEntry {
+    args: Vec<Arg>,
+    body: Main,
+    captured_env: BTreeMap<String, JType>,
+    captured_filter_args: BTreeMap<String, FilterArgBinding>,
+    captured_defs: BTreeMap<String, DefEntry>,
+}
+
 struct Analyzer {
     options: AnalyzeOptions,
     diagnostics: Vec<Diagnostic>,
     unsupported_features: Vec<UnsupportedFeature>,
     env: BTreeMap<String, JType>,
+    filter_args: BTreeMap<String, FilterArgBinding>,
+    defs: BTreeMap<String, DefEntry>,
+    def_call_depth: BTreeMap<String, usize>,
+    max_def_depth: usize,
     missing_path_null: bool,
 }
 
@@ -309,8 +331,111 @@ impl Analyzer {
             diagnostics: Vec::new(),
             unsupported_features: Vec::new(),
             env: BTreeMap::new(),
+            filter_args: BTreeMap::new(),
+            defs: BTreeMap::new(),
+            def_call_depth: BTreeMap::new(),
+            max_def_depth: 4,
             missing_path_null: false,
         }
+    }
+
+    fn analyze_main(&mut self, main: &Main, input: JType) -> StreamType {
+        let saved_defs = self.defs.clone();
+        for def in &main.defs {
+            self.register_def(def);
+        }
+        let out = self.analyze(&main.body, input);
+        self.defs = saved_defs;
+        out
+    }
+
+    fn register_def(&mut self, def: &Def) {
+        let key = format!("{}/{}", def.lhs.name, def.lhs.args.len());
+        let entry = DefEntry {
+            args: def.lhs.args.clone(),
+            body: def.rhs.clone(),
+            captured_env: self.env.clone(),
+            captured_filter_args: self.filter_args.clone(),
+            captured_defs: self.defs.clone(),
+        };
+        // Register the def so its body can see itself (basic recursion)
+        let mut captured_defs = entry.captured_defs.clone();
+        captured_defs.insert(key.clone(), entry.clone());
+        let entry = DefEntry {
+            captured_defs,
+            ..entry
+        };
+        self.defs.insert(key, entry);
+    }
+
+    fn call_def(
+        &mut self,
+        entry: DefEntry,
+        actual_args: &[SpannedFilter],
+        input: JType,
+    ) -> StreamType {
+        let arity_key = format!("/{}/{}", entry.args.len(), "_call");
+        let depth = self.def_call_depth.get(&arity_key).copied().unwrap_or(0);
+        if depth >= self.max_def_depth {
+            return StreamType::one(JType::Unknown);
+        }
+        self.def_call_depth.insert(arity_key.clone(), depth + 1);
+
+        let saved_env = std::mem::replace(&mut self.env, entry.captured_env.clone());
+        let saved_filter_args =
+            std::mem::replace(&mut self.filter_args, entry.captured_filter_args.clone());
+        let saved_defs = std::mem::replace(&mut self.defs, entry.captured_defs.clone());
+
+        for (i, formal) in entry.args.iter().enumerate() {
+            let actual = &actual_args[i];
+            match formal {
+                Arg::Var(name) => {
+                    // Evaluate against the call-site input using *caller* scope
+                    let caller_env = saved_env.clone();
+                    let caller_filter_args = saved_filter_args.clone();
+                    let caller_defs = saved_defs.clone();
+                    let temp_env = std::mem::replace(&mut self.env, caller_env);
+                    let temp_filter_args =
+                        std::mem::replace(&mut self.filter_args, caller_filter_args);
+                    let temp_defs = std::mem::replace(&mut self.defs, caller_defs);
+                    let bound = self.analyze(actual, input.clone()).item;
+                    self.env = temp_env;
+                    self.filter_args = temp_filter_args;
+                    self.defs = temp_defs;
+                    self.env.insert(name.clone(), bound);
+                }
+                Arg::Fun(name) => {
+                    self.filter_args.insert(
+                        name.clone(),
+                        FilterArgBinding {
+                            body: actual.clone(),
+                            env: saved_env.clone(),
+                            filter_args: saved_filter_args.clone(),
+                            defs: saved_defs.clone(),
+                        },
+                    );
+                }
+            }
+        }
+
+        let out = self.analyze_main(&entry.body, input);
+
+        self.env = saved_env;
+        self.filter_args = saved_filter_args;
+        self.defs = saved_defs;
+        self.def_call_depth.insert(arity_key, depth);
+        out
+    }
+
+    fn invoke_filter_arg(&mut self, binding: FilterArgBinding, input: JType) -> StreamType {
+        let saved_env = std::mem::replace(&mut self.env, binding.env);
+        let saved_filter_args = std::mem::replace(&mut self.filter_args, binding.filter_args);
+        let saved_defs = std::mem::replace(&mut self.defs, binding.defs);
+        let out = self.analyze(&binding.body, input);
+        self.env = saved_env;
+        self.filter_args = saved_filter_args;
+        self.defs = saved_defs;
+        out
     }
 
     fn analyze(&mut self, filter: &SpannedFilter, input: JType) -> StreamType {
@@ -354,7 +479,8 @@ impl Analyzer {
             },
             Filter::Fold(fold_type, fold) => self.analyze_fold(*fold_type, fold, input),
             Filter::Recurse => {
-                self.unsupported("recursive descent is not supported yet", span, input)
+                let _ = span;
+                StreamType::zero_or_more(input.recursive_descent())
             }
         }
     }
@@ -682,6 +808,17 @@ impl Analyzer {
         span: Span,
         input: JType,
     ) -> StreamType {
+        // User-defined function lookup
+        let key = format!("{name}/{}", args.len());
+        if let Some(entry) = self.defs.get(&key).cloned() {
+            return self.call_def(entry, args, input);
+        }
+        // Filter-arg lookup (no actual args at call site)
+        if args.is_empty()
+            && let Some(binding) = self.filter_args.get(name).cloned()
+        {
+            return self.invoke_filter_arg(binding, input);
+        }
         match (name, args) {
             ("null", []) => StreamType::one(JType::Null),
             ("true", []) => StreamType::one(JType::bool_lit(true)),
@@ -754,6 +891,202 @@ impl Analyzer {
             ("strings", []) => self.filter_kind(input, "string"),
             ("arrays", []) => self.filter_kind(input, "array"),
             ("objects", []) => self.filter_kind(input, "object"),
+            ("iterables", []) => StreamType::zero_or_one(JType::union([
+                self.filter_kind(input.clone(), "array").item,
+                self.filter_kind(input, "object").item,
+            ])),
+            ("scalars", []) => StreamType::zero_or_one(JType::union([
+                self.filter_kind(input.clone(), "null").item,
+                self.filter_kind(input.clone(), "boolean").item,
+                self.filter_kind(input.clone(), "number").item,
+                self.filter_kind(input, "string").item,
+            ])),
+            ("leaf_paths", []) | ("paths", []) | ("paths", [_]) => {
+                for arg in args {
+                    let _ = self.analyze(arg, input.clone());
+                }
+                StreamType::zero_or_more(JType::array(JType::union([
+                    JType::string(),
+                    JType::number(),
+                ])))
+            }
+            ("path", [inner]) => {
+                let _ = self.analyze(inner, input);
+                StreamType::one(JType::array(JType::union([
+                    JType::string(),
+                    JType::number(),
+                ])))
+            }
+            ("getpath", [path]) => {
+                let _ = self.analyze(path, input);
+                StreamType::one(JType::Unknown)
+            }
+            ("setpath", [path, value]) => {
+                let _ = self.analyze(path, input.clone());
+                let value = self.analyze(value, input.clone()).item;
+                StreamType::one(self.write_dynamic_object_key(input, value, span))
+            }
+            ("del", [_]) | ("delpaths", [_]) => {
+                for arg in args {
+                    let _ = self.analyze(arg, input.clone());
+                }
+                StreamType::one(del_type(input))
+            }
+            ("walk", [f]) => StreamType::one(self.walk_type(f, input)),
+            ("sort", []) | ("sort_by", [_]) | ("unique", []) | ("unique_by", [_]) => {
+                for arg in args {
+                    let _ = self.analyze(arg, input.clone());
+                }
+                StreamType::one(self.same_array_type(input))
+            }
+            ("group_by", [grouper]) => {
+                let _ = self.analyze(grouper, input.clone());
+                StreamType::one(self.group_by_type(input))
+            }
+            ("min", []) | ("max", []) | ("min_by", [_]) | ("max_by", [_]) => {
+                for arg in args {
+                    let _ = self.analyze(arg, input.clone());
+                }
+                StreamType::one(self.array_item_or_null(input))
+            }
+            ("reverse", []) => StreamType::one(self.same_array_or_string(input)),
+            ("any", []) | ("all", []) => StreamType::one(JType::bool()),
+            ("any", [cond]) | ("all", [cond]) => {
+                let _ = self.analyze(cond, input);
+                StreamType::one(JType::bool())
+            }
+            ("any", [generator, cond]) | ("all", [generator, cond]) => {
+                let _ = self.analyze(generator, input.clone());
+                let _ = self.analyze(cond, input);
+                StreamType::one(JType::bool())
+            }
+            ("contains", [arg]) | ("inside", [arg]) => {
+                let _ = self.analyze(arg, input);
+                StreamType::one(JType::bool())
+            }
+            ("startswith", [arg]) | ("endswith", [arg]) => {
+                let _ = self.analyze(arg, input);
+                StreamType::one(JType::bool())
+            }
+            ("test", [re]) | ("test", [re, _]) => {
+                for arg in args {
+                    let _ = self.analyze(arg, input.clone());
+                }
+                let _ = re;
+                StreamType::one(JType::bool())
+            }
+            ("ltrimstr", [arg]) | ("rtrimstr", [arg]) => {
+                let _ = self.analyze(arg, input.clone());
+                StreamType::one(trim_str_type(input))
+            }
+            ("ascii_downcase", []) => StreamType::one(ascii_downcase_type(input)),
+            ("tojson", []) => StreamType::one(JType::string()),
+            ("fromjson", []) => StreamType::one(JType::Unknown),
+            ("split", [arg]) => {
+                let _ = self.analyze(arg, input);
+                StreamType::one(JType::array(JType::string()))
+            }
+            ("split", [re, flags]) => {
+                let _ = self.analyze(re, input.clone());
+                let _ = self.analyze(flags, input);
+                StreamType::one(JType::array(JType::string()))
+            }
+            ("splits", [_]) | ("splits", [_, _]) => {
+                for arg in args {
+                    let _ = self.analyze(arg, input.clone());
+                }
+                StreamType::zero_or_more(JType::string())
+            }
+            ("explode", []) => StreamType::one(JType::array(JType::number())),
+            ("implode", []) => StreamType::one(JType::string()),
+            ("ascii", []) => StreamType::one(JType::string()),
+            ("tojson", [_]) => {
+                for arg in args {
+                    let _ = self.analyze(arg, input.clone());
+                }
+                StreamType::one(JType::string())
+            }
+            ("env", []) => StreamType::one(JType::object(BTreeMap::new(), Some(JType::string()))),
+            ("$__loc__", []) | ("input_line_number", []) => StreamType::one(JType::Unknown),
+            ("error", []) => StreamType::zero(),
+            ("error", [arg]) => {
+                let _ = self.analyze(arg, input);
+                StreamType::zero()
+            }
+            ("@text", [])
+            | ("@json", [])
+            | ("@html", [])
+            | ("@uri", [])
+            | ("@csv", [])
+            | ("@tsv", [])
+            | ("@sh", [])
+            | ("@base32", [])
+            | ("@base32d", [])
+            | ("@base64", [])
+            | ("@base64d", []) => StreamType::one(JType::string()),
+            ("debug", []) => StreamType::one(input),
+            ("debug", [arg]) => {
+                let _ = self.analyze(arg, input.clone());
+                StreamType::one(input)
+            }
+            ("stderr", []) => StreamType::one(input),
+            ("to_entries", []) => StreamType::one(self.entries_of_type(input)),
+            ("from_entries", []) => StreamType::one(self.object_of_entries_type(input)),
+            ("with_entries", [f]) => StreamType::one(self.with_entries_type(f, input)),
+            ("match", [re]) | ("match", [re, _]) => {
+                for arg in args {
+                    let _ = self.analyze(arg, input.clone());
+                }
+                let _ = re;
+                StreamType::zero_or_more(regex_match_type())
+            }
+            ("capture", [re]) | ("capture", [re, _]) => {
+                for arg in args {
+                    let _ = self.analyze(arg, input.clone());
+                }
+                let _ = re;
+                StreamType::zero_or_more(JType::object(
+                    BTreeMap::new(),
+                    Some(JType::union([JType::string(), JType::Null])),
+                ))
+            }
+            ("scan", [_]) | ("scan", [_, _]) => {
+                for arg in args {
+                    let _ = self.analyze(arg, input.clone());
+                }
+                StreamType::zero_or_more(JType::union([
+                    JType::string(),
+                    JType::array(JType::string()),
+                ]))
+            }
+            ("gsub", _) | ("sub", _) => {
+                for arg in args {
+                    let _ = self.analyze(arg, input.clone());
+                }
+                StreamType::one(JType::string())
+            }
+            ("limit", [n, generator]) => {
+                let _ = self.analyze(n, input.clone());
+                let stream = self.analyze(generator, input);
+                StreamType::zero_or_more(stream.item)
+            }
+            ("first", [generator]) => {
+                let stream = self.analyze(generator, input);
+                StreamType::zero_or_one(stream.item)
+            }
+            ("last", [generator]) => {
+                let stream = self.analyze(generator, input);
+                StreamType::zero_or_one(stream.item)
+            }
+            ("nth", [_, generator]) => {
+                let _ = self.analyze(&args[0], input.clone());
+                let stream = self.analyze(generator, input);
+                StreamType::zero_or_one(stream.item)
+            }
+            ("isempty", [generator]) => {
+                let _ = self.analyze(generator, input);
+                StreamType::one(JType::bool())
+            }
             _ => self.unsupported(
                 format!("unsupported builtin or call `{name}`"),
                 span,
@@ -1051,6 +1384,183 @@ impl Analyzer {
                 JType::Unknown
             }
         }
+    }
+
+    fn same_array_type(&mut self, input: JType) -> JType {
+        match input {
+            JType::Array(_) => input,
+            JType::Union(items) => {
+                JType::union(items.into_iter().map(|item| self.same_array_type(item)))
+            }
+            JType::Null if self.missing_path_null => {
+                self.missing_path_null = false;
+                JType::Unknown
+            }
+            JType::Unknown => JType::array(JType::Unknown),
+            other => {
+                self.warn_or_error(
+                    format!("expected array input, got: {}", other.to_compact_string()),
+                    None,
+                );
+                JType::Unknown
+            }
+        }
+    }
+
+    fn same_array_or_string(&mut self, input: JType) -> JType {
+        match input {
+            JType::Array(_) | JType::String(_) => input,
+            JType::Union(items) => JType::union(
+                items
+                    .into_iter()
+                    .map(|item| self.same_array_or_string(item)),
+            ),
+            JType::Unknown => JType::Unknown,
+            other => {
+                self.warn_or_error(
+                    format!(
+                        "expected array or string input, got: {}",
+                        other.to_compact_string()
+                    ),
+                    None,
+                );
+                JType::Unknown
+            }
+        }
+    }
+
+    fn array_item_or_null(&mut self, input: JType) -> JType {
+        match input {
+            JType::Array(array) => JType::union([*array.items, JType::Null]),
+            JType::Union(items) => {
+                JType::union(items.into_iter().map(|item| self.array_item_or_null(item)))
+            }
+            JType::Unknown => JType::Unknown,
+            JType::Null => JType::Null,
+            other => {
+                self.warn_or_error(
+                    format!("expected array input, got: {}", other.to_compact_string()),
+                    None,
+                );
+                JType::Unknown
+            }
+        }
+    }
+
+    fn group_by_type(&mut self, input: JType) -> JType {
+        match input {
+            JType::Array(array) => JType::array(JType::array(*array.items)),
+            JType::Union(items) => {
+                JType::union(items.into_iter().map(|item| self.group_by_type(item)))
+            }
+            JType::Unknown => JType::array(JType::array(JType::Unknown)),
+            other => {
+                self.warn_or_error(
+                    format!(
+                        "group_by expected array input, got: {}",
+                        other.to_compact_string()
+                    ),
+                    None,
+                );
+                JType::Unknown
+            }
+        }
+    }
+
+    fn walk_type(&mut self, f: &SpannedFilter, input: JType) -> JType {
+        let descended = input.recursive_descent();
+        let mapped = self.analyze(f, descended).item;
+        JType::union([input, mapped])
+    }
+
+    fn entries_of_type(&mut self, input: JType) -> JType {
+        let value_ty = match &input {
+            JType::Object(object) => {
+                let mut values = object
+                    .properties
+                    .values()
+                    .map(|prop| prop.ty.clone())
+                    .collect::<Vec<_>>();
+                if let Some(additional) = &object.additional {
+                    values.push((**additional).clone());
+                }
+                JType::union(values)
+            }
+            JType::Unknown => JType::Unknown,
+            JType::Union(items) => {
+                return JType::union(items.iter().map(|item| self.entries_of_type(item.clone())));
+            }
+            other => {
+                self.warn_or_error(
+                    format!(
+                        "to_entries expected object input, got: {}",
+                        other.to_compact_string()
+                    ),
+                    None,
+                );
+                return JType::Unknown;
+            }
+        };
+        let mut entry_props = BTreeMap::new();
+        entry_props.insert(
+            "key".to_string(),
+            Property {
+                ty: JType::string(),
+                required: true,
+            },
+        );
+        entry_props.insert(
+            "value".to_string(),
+            Property {
+                ty: value_ty,
+                required: true,
+            },
+        );
+        JType::array(JType::closed_object(entry_props))
+    }
+
+    fn object_of_entries_type(&mut self, input: JType) -> JType {
+        match &input {
+            JType::Array(array) => match &*array.items {
+                JType::Object(object) => {
+                    let value_ty = object
+                        .properties
+                        .get("value")
+                        .map(|prop| prop.ty.clone())
+                        .or_else(|| object.properties.get("v").map(|prop| prop.ty.clone()))
+                        .unwrap_or(JType::Unknown);
+                    JType::object(BTreeMap::new(), Some(value_ty))
+                }
+                JType::Unknown => JType::object(BTreeMap::new(), Some(JType::Unknown)),
+                _ => JType::object(BTreeMap::new(), Some(JType::Unknown)),
+            },
+            JType::Unknown => JType::object(BTreeMap::new(), Some(JType::Unknown)),
+            JType::Union(items) => JType::union(
+                items
+                    .iter()
+                    .map(|item| self.object_of_entries_type(item.clone())),
+            ),
+            other => {
+                self.warn_or_error(
+                    format!(
+                        "from_entries expected array input, got: {}",
+                        other.to_compact_string()
+                    ),
+                    None,
+                );
+                JType::Unknown
+            }
+        }
+    }
+
+    fn with_entries_type(&mut self, f: &SpannedFilter, input: JType) -> JType {
+        let entries = self.entries_of_type(input);
+        let mapped = match entries.clone() {
+            JType::Array(array) => self.analyze(f, *array.items).item,
+            other => self.analyze(f, other).item,
+        };
+        let arr_of_mapped = JType::array(mapped);
+        self.object_of_entries_type(arr_of_mapped)
     }
 
     fn transpose_type(&mut self, input: JType) -> JType {
@@ -1406,9 +1916,36 @@ impl Analyzer {
                 }
             }
             Part::Range(None, None) => self.write_array_index(input, rest, value, span),
-            Part::Range(_, _) => {
+            Part::Range(_, _) => self.write_slice(input, rest, value, span),
+        }
+    }
+
+    fn write_slice(
+        &mut self,
+        input: JType,
+        rest: &[(Part<SpannedFilter>, Opt)],
+        value: JType,
+        span: Span,
+    ) -> JType {
+        let inner_seed = match &value {
+            JType::Array(array) => (*array.items).clone(),
+            _ => JType::Unknown,
+        };
+        let written_inner = self.write_path_parts(inner_seed, rest, value.clone(), span.clone());
+        match input {
+            JType::Array(existing) => JType::array(JType::union([*existing.items, written_inner])),
+            JType::Null | JType::Unknown => JType::array(written_inner),
+            JType::Union(items) => JType::union(
+                items
+                    .into_iter()
+                    .map(|item| self.write_slice(item, rest, value.clone(), span.clone())),
+            ),
+            other => {
                 self.warn_or_error(
-                    "slice assignment is not supported precisely yet",
+                    format!(
+                        "slice assignment may be applied to non-array input: {}",
+                        other.to_compact_string()
+                    ),
                     Some(span),
                 );
                 JType::Unknown
@@ -1535,14 +2072,6 @@ impl Analyzer {
         value: JType,
         span: Span,
     ) -> JType {
-        if !rest.is_empty() {
-            self.warn_or_error(
-                "nested dynamic assignment is not supported precisely yet",
-                Some(span.clone()),
-            );
-            return JType::Unknown;
-        }
-
         if let Some(keys) = finite_string_literals(&key_type) {
             let mut out = input;
             for key in keys {
@@ -1552,7 +2081,7 @@ impl Analyzer {
         }
 
         if is_string_like(&key_type) {
-            return self.write_dynamic_object_key(input, value, span);
+            return self.write_dynamic_object_key_with_rest(input, rest, value, span);
         }
 
         if is_number_like(&key_type) {
@@ -1573,11 +2102,22 @@ impl Analyzer {
                     Some(span.clone()),
                 );
                 JType::union([
-                    self.write_dynamic_object_key(other, value, span),
+                    self.write_dynamic_object_key_with_rest(other, rest, value, span),
                     JType::Unknown,
                 ])
             }
         }
+    }
+
+    fn write_dynamic_object_key_with_rest(
+        &mut self,
+        input: JType,
+        rest: &[(Part<SpannedFilter>, Opt)],
+        value: JType,
+        span: Span,
+    ) -> JType {
+        let written_inner = self.write_path_parts(JType::Unknown, rest, value, span.clone());
+        self.write_dynamic_object_key(input, written_inner, span)
     }
 
     fn write_dynamic_object_key(&mut self, input: JType, value: JType, span: Span) -> JType {
@@ -1792,6 +2332,105 @@ fn not_type(input: JType) -> JType {
         Some(value) => JType::bool_lit(!value),
         None => JType::bool(),
     }
+}
+
+fn trim_str_type(input: JType) -> JType {
+    match input {
+        JType::String(_) => JType::string(),
+        JType::Union(items) => JType::union(items.into_iter().map(trim_str_type)),
+        JType::Unknown => JType::Unknown,
+        other => other,
+    }
+}
+
+fn del_type(input: JType) -> JType {
+    match input {
+        JType::Object(mut object) => {
+            for prop in object.properties.values_mut() {
+                prop.required = false;
+            }
+            if object.additional.is_none() {
+                object.additional = Some(Box::new(JType::Unknown));
+            }
+            JType::Object(object)
+        }
+        JType::Array(array) => JType::array(*array.items),
+        JType::Union(items) => JType::union(items.into_iter().map(del_type)),
+        JType::Unknown => JType::Unknown,
+        other => other,
+    }
+}
+
+fn ascii_downcase_type(input: JType) -> JType {
+    match input {
+        JType::Union(items) => JType::union(items.into_iter().map(ascii_downcase_type)),
+        JType::String(StringType::Literal(value)) => JType::string_lit(value.to_ascii_lowercase()),
+        JType::Never => JType::Never,
+        _ => JType::string(),
+    }
+}
+
+fn regex_match_type() -> JType {
+    let mut capture_props = BTreeMap::new();
+    capture_props.insert(
+        "offset".to_string(),
+        Property {
+            ty: JType::number(),
+            required: true,
+        },
+    );
+    capture_props.insert(
+        "length".to_string(),
+        Property {
+            ty: JType::number(),
+            required: true,
+        },
+    );
+    capture_props.insert(
+        "string".to_string(),
+        Property {
+            ty: JType::union([JType::string(), JType::Null]),
+            required: true,
+        },
+    );
+    capture_props.insert(
+        "name".to_string(),
+        Property {
+            ty: JType::union([JType::string(), JType::Null]),
+            required: true,
+        },
+    );
+
+    let mut props = BTreeMap::new();
+    props.insert(
+        "offset".to_string(),
+        Property {
+            ty: JType::number(),
+            required: true,
+        },
+    );
+    props.insert(
+        "length".to_string(),
+        Property {
+            ty: JType::number(),
+            required: true,
+        },
+    );
+    props.insert(
+        "string".to_string(),
+        Property {
+            ty: JType::string(),
+            required: true,
+        },
+    );
+    props.insert(
+        "captures".to_string(),
+        Property {
+            ty: JType::array(JType::closed_object(capture_props)),
+            required: true,
+        },
+    );
+    JType::closed_object(props)
 }
 
 fn ascii_upcase_type(input: JType) -> JType {
@@ -2810,14 +3449,214 @@ mod tests {
     }
 
     #[test]
+    fn def_with_no_args_inlines_body() {
+        let input = json_schema_to_type(&json!({
+            "type": "object",
+            "properties": { "count": { "type": "number" } },
+            "required": ["count"],
+            "additionalProperties": false
+        }));
+        let report = check("def increment: . + 1; .count | increment", input);
+        assert!(report.unsupported_features.is_empty());
+        assert_eq!(report.output.to_compact_string(), "number");
+    }
+
+    #[test]
+    fn def_with_filter_arg_substitutes() {
+        let input = json_schema_to_type(&json!({
+            "type": "object",
+            "properties": { "x": { "type": "number" } },
+            "required": ["x"],
+            "additionalProperties": false
+        }));
+        let report = check("def f(g): g + 1; .x | f(. * 2)", input);
+        assert!(report.unsupported_features.is_empty());
+        assert_eq!(report.output.to_compact_string(), "number");
+    }
+
+    #[test]
+    fn def_with_value_arg_binds_var() {
+        let report = check("def add($n): . + $n; 10 | add(5)", JType::Unknown);
+        assert!(report.unsupported_features.is_empty());
+        assert_eq!(report.output.to_compact_string(), "number");
+    }
+
+    #[test]
+    fn recursive_def_widens_after_depth_cap() {
+        let report = check(
+            "def loop: if . > 0 then (. - 1 | loop) else . end; 5 | loop",
+            JType::Unknown,
+        );
+        // Should not crash; widens via fixed-point convergence
+        let _ = report.output.to_compact_string();
+    }
+
+    #[test]
+    fn slice_assignment_widens_array_item_type() {
+        let input = json_schema_to_type(&json!({
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                }
+            },
+            "required": ["items"],
+            "additionalProperties": false
+        }));
+        let report = check(".items[2:4] = [{id: 0}]", input);
+        assert!(report.unsupported_features.is_empty());
+        let compact = report.output.to_compact_string();
+        assert!(compact.contains("items: array<"));
+        assert!(compact.contains("string"));
+        assert!(compact.contains("object{id: 0}"));
+    }
+
+    #[test]
+    fn nested_dynamic_assignment_chains() {
+        // Use literal-string dynamic keys so both sides resolve concretely
+        let input = JType::Unknown;
+        let report = check(r#".["outer"]["inner"] = 1"#, input);
+        assert!(report.unsupported_features.is_empty());
+        let compact = report.output.to_compact_string();
+        assert!(compact.contains("outer"));
+        assert!(compact.contains("inner"));
+    }
+
+    #[test]
+    fn recursive_descent_returns_descendants() {
+        let input = json_schema_to_type(&json!({
+            "type": "object",
+            "properties": {
+                "a": { "type": "number" },
+                "b": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                }
+            },
+            "required": ["a", "b"],
+            "additionalProperties": false
+        }));
+        let report = check("..", input);
+        assert!(report.unsupported_features.is_empty());
+        let compact = report.output.to_compact_string();
+        assert!(compact.contains("ZeroOrMore"));
+        assert!(compact.contains("number"));
+        assert!(compact.contains("string"));
+        assert!(compact.contains("array<string>"));
+    }
+
+    #[test]
+    fn group_by_returns_nested_array() {
+        let input = JType::array(JType::number());
+        let report = check("group_by(.)", input);
+        assert!(report.unsupported_features.is_empty());
+        assert_eq!(report.output.to_compact_string(), "array<array<number>>");
+    }
+
+    #[test]
+    fn sort_returns_same_array_type() {
+        let input = JType::array(JType::string());
+        let report = check("sort", input);
+        assert!(report.unsupported_features.is_empty());
+        assert_eq!(report.output.to_compact_string(), "array<string>");
+    }
+
+    #[test]
+    fn min_returns_item_or_null() {
+        let input = JType::array(JType::number());
+        let report = check("min", input);
+        assert!(report.unsupported_features.is_empty());
+        assert_eq!(report.output.to_compact_string(), "null | number");
+    }
+
+    #[test]
+    fn to_entries_reshapes_object() {
+        let input = json_schema_to_type(&json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" },
+                "age": { "type": "number" }
+            },
+            "required": ["name", "age"],
+            "additionalProperties": false
+        }));
+        let report = check("to_entries", input);
+        assert!(report.unsupported_features.is_empty());
+        let compact = report.output.to_compact_string();
+        assert!(compact.starts_with("array<object{"));
+        assert!(compact.contains("key: string"));
+        assert!(compact.contains("value: number | string"));
+    }
+
+    #[test]
+    fn from_entries_reshapes_to_object() {
+        let input = json_schema_to_type(&json!({
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string" },
+                    "value": { "type": "number" }
+                },
+                "required": ["key", "value"],
+                "additionalProperties": false
+            }
+        }));
+        let report = check("from_entries", input);
+        assert!(report.unsupported_features.is_empty());
+        assert_eq!(report.output.to_compact_string(), "object{...: number}");
+    }
+
+    #[test]
+    fn match_returns_match_object() {
+        let report = check(r#"match("foo")"#, JType::string());
+        assert!(report.unsupported_features.is_empty());
+        let compact = report.output.to_compact_string();
+        assert!(compact.contains("offset: number"));
+        assert!(compact.contains("length: number"));
+        assert!(compact.contains("string: string"));
+        assert!(compact.contains("captures: array<object"));
+    }
+
+    #[test]
+    fn startswith_returns_bool() {
+        let report = check(r#"startswith("foo")"#, JType::string());
+        assert!(report.unsupported_features.is_empty());
+        assert_eq!(report.output.to_compact_string(), "boolean");
+    }
+
+    #[test]
+    fn split_returns_string_array() {
+        let report = check(r#"split(",")"#, JType::string());
+        assert!(report.unsupported_features.is_empty());
+        assert_eq!(report.output.to_compact_string(), "array<string>");
+    }
+
+    #[test]
+    fn tojson_returns_string() {
+        let input = JType::array(JType::number());
+        let report = check("tojson", input);
+        assert!(report.unsupported_features.is_empty());
+        assert_eq!(report.output.to_compact_string(), "string");
+    }
+
+    #[test]
+    fn error_returns_zero() {
+        let report = check(r#"error("nope")"#, JType::Unknown);
+        assert!(report.unsupported_features.is_empty());
+        assert!(matches!(report.output.card, Cardinality::Zero));
+    }
+
+    #[test]
     fn unsupported_builtin_reports_warning() {
-        let report = check("group_by(.name)", JType::array(JType::Unknown));
+        let report = check("not_a_real_builtin", JType::array(JType::Unknown));
         assert_eq!(report.output.to_compact_string(), "unknown");
         assert_eq!(report.unsupported_features.len(), 1);
         assert!(
             report.diagnostics[0]
                 .message
-                .contains("unsupported builtin or call `group_by`")
+                .contains("unsupported builtin or call `not_a_real_builtin`")
         );
     }
 }

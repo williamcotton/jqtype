@@ -466,11 +466,11 @@ describe("analyzer — small cases", () => {
     const parseReport = analyzeFilter(".foo |");
     expect(parseReport.diagnostics[0]?.span).toEqual({ start: 6, end: 6 });
 
-    const unsupported = analyzeFilter("group_by(.name)");
-    expect(unsupported.diagnostics[0]?.span).toEqual({ start: 0, end: 8 });
+    const unsupported = analyzeFilter("not_a_real_builtin");
+    expect(unsupported.diagnostics[0]?.span).toEqual({ start: 0, end: 18 });
     expect(unsupported.unsupported_features[0]?.span).toEqual({
       start: 0,
-      end: 8,
+      end: 18,
     });
 
     const unbound = analyzeFilter("$context.foo");
@@ -478,11 +478,11 @@ describe("analyzer — small cases", () => {
   });
 
   it("unsupported builtin produces a warning", () => {
-    const r = check("group_by(.name)", JType.array("Unknown"));
+    const r = check("not_a_real_builtin", JType.array("Unknown"));
     expect(StreamType.toCompactString(r.output)).toBe("unknown");
     expect(r.unsupported_features.length).toBe(1);
     expect(r.diagnostics[0]?.message).toMatch(
-      /unsupported builtin or call `group_by`/,
+      /unsupported builtin or call `not_a_real_builtin`/,
     );
   });
 
@@ -538,5 +538,217 @@ describe("analyzer — small cases", () => {
     expect(StreamType.toCompactString(r.output)).toBe(
       "Stream<object{id: number, name: string}, ZeroOrMore>",
     );
+  });
+
+  it("recursive descent returns descendants", () => {
+    const input = jsonSchemaToType({
+      type: "object",
+      properties: {
+        a: { type: "number" },
+        b: { type: "array", items: { type: "string" } },
+      },
+      required: ["a", "b"],
+      additionalProperties: false,
+    });
+    const r = check("..", input);
+    expect(r.unsupported_features).toHaveLength(0);
+    const compact = StreamType.toCompactString(r.output);
+    expect(compact).toContain("ZeroOrMore");
+    expect(compact).toContain("number");
+    expect(compact).toContain("string");
+    expect(compact).toContain("array<string>");
+  });
+
+  it("group_by returns nested arrays", () => {
+    const r = check("group_by(.)", JType.array(JType.number()));
+    expect(r.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(r.output)).toBe(
+      "array<array<number>>",
+    );
+  });
+
+  it("sort preserves array type", () => {
+    const r = check("sort", JType.array(JType.string()));
+    expect(r.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(r.output)).toBe("array<string>");
+  });
+
+  it("min returns item or null", () => {
+    const r = check("min", JType.array(JType.number()));
+    expect(r.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(r.output)).toBe("null | number");
+  });
+
+  it("to_entries reshapes object to array", () => {
+    const input = jsonSchemaToType({
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        age: { type: "number" },
+      },
+      required: ["name", "age"],
+      additionalProperties: false,
+    });
+    const r = check("to_entries", input);
+    expect(r.unsupported_features).toHaveLength(0);
+    const compact = StreamType.toCompactString(r.output);
+    expect(compact).toContain("array<object{");
+    expect(compact).toContain("key: string");
+    expect(compact).toContain("value: number | string");
+  });
+
+  it("from_entries reshapes array to object", () => {
+    const input = jsonSchemaToType({
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          key: { type: "string" },
+          value: { type: "number" },
+        },
+        required: ["key", "value"],
+        additionalProperties: false,
+      },
+    });
+    const r = check("from_entries", input);
+    expect(r.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(r.output)).toBe("object{...: number}");
+  });
+
+  it("match returns regex match object", () => {
+    const r = check('match("foo")', JType.string());
+    expect(r.unsupported_features).toHaveLength(0);
+    const compact = StreamType.toCompactString(r.output);
+    expect(compact).toContain("offset: number");
+    expect(compact).toContain("length: number");
+    expect(compact).toContain("string: string");
+    expect(compact).toContain("captures: array<object");
+  });
+
+  it("startswith returns bool", () => {
+    const r = check('startswith("foo")', JType.string());
+    expect(r.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(r.output)).toBe("boolean");
+  });
+
+  it("split returns string array", () => {
+    const r = check('split(",")', JType.string());
+    expect(r.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(r.output)).toBe("array<string>");
+  });
+
+  it("tojson returns string", () => {
+    const r = check("tojson", JType.array(JType.number()));
+    expect(r.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(r.output)).toBe("string");
+  });
+
+  it("error returns zero outputs", () => {
+    const r = check('error("nope")', "Unknown");
+    expect(r.unsupported_features).toHaveLength(0);
+    expect(r.output.card).toBe("Zero");
+  });
+
+  it("object destructuring is reported as unsupported (jaq alignment)", () => {
+    const input = jsonSchemaToType({
+      type: "object",
+      properties: { name: { type: "string" } },
+      required: ["name"],
+      additionalProperties: false,
+    });
+    const r = check(". as {name: $n} | $n", input);
+    expect(
+      r.diagnostics.some((d) =>
+        d.message.includes("destructuring variable bindings are not supported precisely yet"),
+      ),
+    ).toBe(true);
+  });
+
+  it("slice assignment widens array item type", () => {
+    const input = jsonSchemaToType({
+      type: "object",
+      properties: {
+        items: { type: "array", items: { type: "string" } },
+      },
+      required: ["items"],
+      additionalProperties: false,
+    });
+    const r = check(".items[2:4] = [{id: 0}]", input);
+    expect(r.unsupported_features).toHaveLength(0);
+    const compact = StreamType.toCompactString(r.output);
+    expect(compact).toMatch(/items: array</);
+    expect(compact).toContain("object{id: 0}");
+    expect(compact).toContain("string");
+  });
+
+  it("nested dynamic assignment chains through literal keys", () => {
+    const r = check('.["outer"]["inner"] = 1', "Unknown");
+    expect(r.unsupported_features).toHaveLength(0);
+    const compact = StreamType.toCompactString(r.output);
+    expect(compact).toContain("outer");
+    expect(compact).toContain("inner");
+  });
+
+  it("array destructuring is reported as unsupported (jaq alignment)", () => {
+    const input = JType.array(JType.string());
+    const r = check(". as [$first, $second] | $first", input);
+    expect(
+      r.diagnostics.some((d) =>
+        d.message.includes("destructuring variable bindings are not supported precisely yet"),
+      ),
+    ).toBe(true);
+  });
+
+  it("label/break are reported as unsupported (jaq alignment)", () => {
+    const r = check("label $out | break $out", "Unknown");
+    expect(
+      r.unsupported_features.some((u) =>
+        u.feature.includes("labels and break are not supported yet"),
+      ),
+    ).toBe(true);
+  });
+
+  it("def with no args inlines body", () => {
+    const r = check("def increment: . + 1; .count | increment", jsonSchemaToType({
+      type: "object",
+      properties: { count: { type: "number" } },
+      required: ["count"],
+      additionalProperties: false,
+    }));
+    expect(r.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(r.output)).toBe("number");
+  });
+
+  it("def with filter arg substitutes the filter", () => {
+    const r = check("def f(g): g + 1; .x | f(. * 2)", jsonSchemaToType({
+      type: "object",
+      properties: { x: { type: "number" } },
+      required: ["x"],
+      additionalProperties: false,
+    }));
+    expect(r.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(r.output)).toBe("number");
+  });
+
+  it("def with value arg binds variable", () => {
+    const r = check("def add($n): . + $n; 10 | add(5)", "Unknown");
+    expect(r.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(r.output)).toBe("number");
+  });
+
+  it("recursive def widens after depth cap", () => {
+    // descend recursively — should still produce a type (likely Unknown after cap)
+    const r = check(
+      "def loop: if . > 0 then (. - 1 | loop) else . end; 5 | loop",
+      "Unknown",
+    );
+    // Doesn't crash, returns some type
+    expect(r.output).toBeDefined();
+  });
+
+  it("format strings return string", () => {
+    const r = check('@uri "\\(.)"', JType.string());
+    expect(r.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(r.output)).toBe("string");
   });
 });

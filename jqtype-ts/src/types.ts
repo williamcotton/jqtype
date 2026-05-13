@@ -178,6 +178,25 @@ export const JType = {
     return t;
   },
 
+  recursiveDescent(t: JType): JType {
+    if (t === "Unknown") return "Unknown";
+    const out: JType[] = [];
+    const walk = (ty: JType): void => {
+      out.push(ty);
+      if (typeof ty === "object") {
+        if ("Array" in ty) walk(ty.Array.items);
+        else if ("Object" in ty) {
+          for (const prop of Object.values(ty.Object.properties)) walk(prop.ty);
+          if (ty.Object.additional !== null) walk(ty.Object.additional);
+        } else if ("Union" in ty) {
+          for (const item of ty.Union) walk(item);
+        }
+      }
+    };
+    walk(t);
+    return JType.union(out);
+  },
+
   toCompactString(t: JType): string {
     return toCompactString(t);
   },

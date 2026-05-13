@@ -177,6 +177,39 @@ impl JType {
         }
     }
 
+    /// Return the union of `self` and every value reachable through
+    /// nested properties, array items, and `additional`. Models the
+    /// item type of jq's recursive descent operator `..`.
+    pub fn recursive_descent(&self) -> Self {
+        fn walk(ty: &JType, out: &mut Vec<JType>) {
+            out.push(ty.clone());
+            match ty {
+                JType::Array(array) => walk(&array.items, out),
+                JType::Object(object) => {
+                    for prop in object.properties.values() {
+                        walk(&prop.ty, out);
+                    }
+                    if let Some(additional) = &object.additional {
+                        walk(additional, out);
+                    }
+                }
+                JType::Union(items) => {
+                    for item in items {
+                        walk(item, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if matches!(self, JType::Unknown) {
+            return JType::Unknown;
+        }
+        let mut out = Vec::new();
+        walk(self, &mut out);
+        JType::union(out)
+    }
+
     pub fn to_compact_string(&self) -> String {
         match self {
             JType::Never => "empty".to_string(),

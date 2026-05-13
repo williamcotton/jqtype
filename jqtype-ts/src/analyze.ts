@@ -25,7 +25,27 @@ import {
   type StrAst,
   type TryAst,
   type VarDeclarationAst,
+  type DestructuringAst,
+  type ObjectDestructuringAst,
+  type ArrayDestructuringAst,
+  type DefAst,
+  type ArgAst,
 } from "./parser.js";
+
+interface FilterArgBinding {
+  expr: ExpressionAst;
+  env: Map<string, JType>;
+  filterArgs: Map<string, FilterArgBinding>;
+  defs: Map<string, DefEntry>;
+}
+
+interface DefEntry {
+  args: ArgAst[];
+  body: ExpressionAst;
+  capturedEnv: Map<string, JType>;
+  capturedFilterArgs: Map<string, FilterArgBinding>;
+  capturedDefs: Map<string, DefEntry>;
+}
 
 export type AnalysisMode = "Permissive" | "Strict";
 export type OutputFormat = "Compact" | "JsonSchema" | "Tree";
@@ -163,7 +183,12 @@ export const JQTYPE_CAPABILITIES: JqtypeCapability[] = [
   { feature: "object merge via +", status: "supported", notes: null },
   { feature: "identity-root updates", status: "partial", notes: "Literal fields, indexes, iterators, and string-like dynamic keys are modeled." },
   { feature: "external variables", status: "supported", notes: "Provide AnalyzeOptions.externalVars." },
-  { feature: "def/modules", status: "unsupported", notes: "Reported as unsupported features." },
+  { feature: "modules", status: "unsupported", notes: "import/include not supported." },
+  { feature: "format strings", status: "supported", notes: "@json/@csv/@uri etc. return string." },
+  { feature: "recursive descent", status: "supported", notes: "`..` returns input plus all descendants as a ZeroOrMore stream." },
+  { feature: "labels/break", status: "unsupported", notes: "Disabled to stay aligned with jaq (which panics on label/break)." },
+  { feature: "destructuring patterns", status: "partial", notes: "Single `as $var` is supported; object/array patterns are disabled to stay aligned with jaq (which fails to parse them)." },
+  { feature: "def", status: "partial", notes: "Non-recursive user-defined functions via substitution; recursion widens to unknown after depth cap." },
 ];
 
 export interface UnsupportedFeature {
@@ -330,6 +355,11 @@ class Analyzer {
   diagnostics: Diagnostic[] = [];
   unsupportedFeatures: UnsupportedFeature[] = [];
   env = new Map<string, JTypeT>();
+  labels = new Set<string>();
+  filterArgs = new Map<string, FilterArgBinding>();
+  defs = new Map<string, DefEntry>();
+  defCallDepth = new Map<string, number>();
+  readonly maxDefDepth = 4;
   missingPathNull = false;
 
   constructor(options: ResolvedAnalyzeOptions, source: string) {
@@ -373,7 +403,7 @@ class Analyzer {
       case "if":
         return this.analyzeIf(expr, input);
       case "filter":
-        return this.analyzeCall(filterIdent(expr.name), expr.args, input);
+        return this.analyzeCall(expr.name, expr.args, input);
       case "try":
         return this.analyzeTry(expr, input);
       case "unary":
@@ -396,26 +426,22 @@ class Analyzer {
       case "foreach":
         return this.analyzeForeach(expr, input);
       case "recursiveDescent":
-        return this.unsupported(
-          "recursive descent is not supported yet",
-          input,
-          this.spanForToken(".."),
-        );
+        return StreamType.zeroOrMore(JType.recursiveDescent(input));
       case "def":
-        return this.unsupported(
-          "function definitions are not supported yet",
-          "Unknown",
-          this.spanForToken("def"),
-        );
+        return this.analyzeDef(expr, input);
       case "label":
       case "break":
+        // jaq (the Rust parser/runtime) does not support label/break yet —
+        // it panics in its AST converter. Keep TS aligned by reporting as
+        // unsupported. The withLabel helper below stays around for the
+        // future, in case jaq adds support.
         return this.unsupported(
           "labels and break are not supported yet",
           input,
           this.spanForToken(expr.type),
         );
       case "format":
-        return this.unsupported("formats are not supported yet", input, this.spanForToken("@"));
+        return StreamType.one(JType.string());
     }
   }
 
@@ -462,6 +488,100 @@ class Analyzer {
     return out;
   }
 
+  analyzeDef(node: DefAst, input: JTypeT): StreamType {
+    // Parser already encodes arity into the name (e.g. "foo/2")
+    const key = node.name;
+    const previous = this.defs.get(key);
+    const entry: DefEntry = {
+      args: node.args,
+      body: node.body,
+      capturedEnv: new Map(this.env),
+      capturedFilterArgs: new Map(this.filterArgs),
+      capturedDefs: new Map(this.defs),
+    };
+    this.defs.set(key, entry);
+    entry.capturedDefs.set(key, entry);
+
+    const result =
+      node.next === undefined ? StreamType.one(input) : this.analyze(node.next, input);
+
+    if (previous === undefined) this.defs.delete(key);
+    else this.defs.set(key, previous);
+    return result;
+  }
+
+  callDef(
+    entry: DefEntry,
+    actualArgs: ExpressionAst[],
+    input: JTypeT,
+  ): StreamType {
+    const key = `${entry.args.length}`;
+    const depth = this.defCallDepth.get(key) ?? 0;
+    if (depth >= this.maxDefDepth) {
+      return StreamType.one("Unknown");
+    }
+    this.defCallDepth.set(key, depth + 1);
+
+    const savedEnv = this.env;
+    const savedFilterArgs = this.filterArgs;
+    const savedDefs = this.defs;
+    const newEnv = new Map(entry.capturedEnv);
+    const newFilterArgs = new Map(entry.capturedFilterArgs);
+    const newDefs = new Map(entry.capturedDefs);
+
+    for (let i = 0; i < entry.args.length; i += 1) {
+      const formal = entry.args[i]!;
+      const actual = actualArgs[i]!;
+      if (formal.type === "varArg") {
+        // Evaluate actual against current call-site input, using caller's scope
+        const bound = this.analyze(actual, input).item;
+        newEnv.set(normalizeVarName(formal.name), bound);
+      } else {
+        // Filter arg: capture AST + caller's scope
+        newFilterArgs.set(formal.name, {
+          expr: actual,
+          env: new Map(this.env),
+          filterArgs: new Map(this.filterArgs),
+          defs: new Map(this.defs),
+        });
+      }
+    }
+
+    this.env = newEnv;
+    this.filterArgs = newFilterArgs;
+    this.defs = newDefs;
+    const out = this.analyze(entry.body, input);
+    this.env = savedEnv;
+    this.filterArgs = savedFilterArgs;
+    this.defs = savedDefs;
+
+    this.defCallDepth.set(key, depth);
+    return out;
+  }
+
+  invokeFilterArg(binding: FilterArgBinding, input: JTypeT): StreamType {
+    const savedEnv = this.env;
+    const savedFilterArgs = this.filterArgs;
+    const savedDefs = this.defs;
+    this.env = new Map(binding.env);
+    this.filterArgs = new Map(binding.filterArgs);
+    this.defs = new Map(binding.defs);
+    const out = this.analyze(binding.expr, input);
+    this.env = savedEnv;
+    this.filterArgs = savedFilterArgs;
+    this.defs = savedDefs;
+    return out;
+  }
+
+  withLabel<T>(rawName: string, f: () => T): T {
+    const name = normalizeVarName(rawName);
+    const had = this.labels.has(name);
+    this.labels.add(name);
+    const out = f();
+    if (!had) this.labels.delete(name);
+    return out;
+  }
+
   withFreshMissingPathScope<T>(f: () => T): T {
     const previous = this.missingPathNull;
     this.missingPathNull = false;
@@ -490,11 +610,26 @@ class Analyzer {
     ty: JTypeT,
     f: () => T,
   ): T {
+    if (destructuring.length === 0) return f();
+    // jaq does not parse object/array destructuring patterns. Keep TS
+    // aligned: only single `as $var` is supported. The collectDestructuring*
+    // / withBindings helpers below stay around for the future.
     if (destructuring.length === 1 && destructuring[0]!.type === "var") {
       return this.withVar(destructuring[0]!.name, ty, f);
     }
     this.warnOrError("destructuring variable bindings are not supported precisely yet");
     return f();
+  }
+
+  withBindings<T>(bindings: Map<string, JTypeT>, f: () => T): T {
+    const names = Array.from(bindings.keys());
+    if (names.length === 0) return f();
+    const head = names[0]!;
+    return this.withVar(head, bindings.get(head)!, () => {
+      const rest = new Map(bindings);
+      rest.delete(head);
+      return this.withBindings(rest, f);
+    });
   }
 
   analyzeReduce(node: ReduceAst, input: JTypeT): StreamType {
@@ -942,7 +1077,19 @@ class Analyzer {
     return StreamType.one(JType.number());
   }
 
-  analyzeCall(name: string, args: ExpressionAst[], input: JTypeT): StreamType {
+  analyzeCall(rawName: string, args: ExpressionAst[], input: JTypeT): StreamType {
+    // Parser passes "name/arity" — keep it for def/filterArg lookup; strip for builtin matching
+    const defEntry = this.defs.get(rawName);
+    if (defEntry !== undefined) {
+      return this.callDef(defEntry, args, input);
+    }
+    if (args.length === 0) {
+      const filterArg = this.filterArgs.get(rawName);
+      if (filterArg !== undefined) {
+        return this.invokeFilterArg(filterArg, input);
+      }
+    }
+    const name = filterIdent(rawName);
     if (name === "null" && args.length === 0) return StreamType.one("Null");
     if (name === "true" && args.length === 0) return StreamType.one(JType.boolLit(true));
     if (name === "false" && args.length === 0) return StreamType.one(JType.boolLit(false));
@@ -1016,11 +1163,311 @@ class Analyzer {
     if (name === "strings" && args.length === 0) return this.filterKind(input, "string");
     if (name === "arrays" && args.length === 0) return this.filterKind(input, "array");
     if (name === "objects" && args.length === 0) return this.filterKind(input, "object");
+    if (name === "iterables" && args.length === 0) {
+      return StreamType.zeroOrOne(
+        JType.union([
+          this.filterKind(input, "array").item,
+          this.filterKind(input, "object").item,
+        ]),
+      );
+    }
+    if (name === "scalars" && args.length === 0) {
+      return StreamType.zeroOrOne(
+        JType.union([
+          this.filterKind(input, "null").item,
+          this.filterKind(input, "boolean").item,
+          this.filterKind(input, "number").item,
+          this.filterKind(input, "string").item,
+        ]),
+      );
+    }
+    if ((name === "paths" || name === "leaf_paths") && (args.length === 0 || (name === "paths" && args.length === 1))) {
+      for (const arg of args) this.analyze(arg, input);
+      return StreamType.zeroOrMore(JType.array(JType.union([JType.string(), JType.number()])));
+    }
+    if (name === "path" && args.length === 1) {
+      this.analyze(args[0]!, input);
+      return StreamType.one(JType.array(JType.union([JType.string(), JType.number()])));
+    }
+    if (name === "getpath" && args.length === 1) {
+      this.analyze(args[0]!, input);
+      return StreamType.one("Unknown");
+    }
+    if (name === "setpath" && args.length === 2) {
+      this.analyze(args[0]!, input);
+      const value = this.analyze(args[1]!, input).item;
+      return StreamType.one(this.writeDynamicObjectKey(input, value));
+    }
+    if ((name === "del" || name === "delpaths") && args.length === 1) {
+      this.analyze(args[0]!, input);
+      return StreamType.one(delType(input));
+    }
+    if (name === "walk" && args.length === 1) {
+      return StreamType.one(this.walkType(args[0]!, input));
+    }
+    if ((name === "sort" || name === "unique") && args.length === 0) {
+      return StreamType.one(this.sameArrayType(input));
+    }
+    if ((name === "sort_by" || name === "unique_by") && args.length === 1) {
+      this.analyze(args[0]!, input);
+      return StreamType.one(this.sameArrayType(input));
+    }
+    if (name === "group_by" && args.length === 1) {
+      this.analyze(args[0]!, input);
+      return StreamType.one(this.groupByType(input));
+    }
+    if ((name === "min" || name === "max") && args.length === 0) {
+      return StreamType.one(this.arrayItemOrNull(input));
+    }
+    if ((name === "min_by" || name === "max_by") && args.length === 1) {
+      this.analyze(args[0]!, input);
+      return StreamType.one(this.arrayItemOrNull(input));
+    }
+    if (name === "reverse" && args.length === 0) {
+      return StreamType.one(this.sameArrayOrString(input));
+    }
+    if ((name === "any" || name === "all") && args.length === 0) {
+      return StreamType.one(JType.bool());
+    }
+    if ((name === "any" || name === "all") && args.length === 1) {
+      this.analyze(args[0]!, input);
+      return StreamType.one(JType.bool());
+    }
+    if ((name === "any" || name === "all") && args.length === 2) {
+      this.analyze(args[0]!, input);
+      this.analyze(args[1]!, input);
+      return StreamType.one(JType.bool());
+    }
+    if ((name === "contains" || name === "inside") && args.length === 1) {
+      this.analyze(args[0]!, input);
+      return StreamType.one(JType.bool());
+    }
+    if ((name === "startswith" || name === "endswith") && args.length === 1) {
+      this.analyze(args[0]!, input);
+      return StreamType.one(JType.bool());
+    }
+    if (name === "test" && (args.length === 1 || args.length === 2)) {
+      for (const arg of args) this.analyze(arg, input);
+      return StreamType.one(JType.bool());
+    }
+    if ((name === "ltrimstr" || name === "rtrimstr") && args.length === 1) {
+      this.analyze(args[0]!, input);
+      return StreamType.one(trimStrType(input));
+    }
+    if (name === "ascii_downcase" && args.length === 0) {
+      return StreamType.one(asciiDowncaseType(input));
+    }
+    if (name === "tojson" && args.length <= 1) {
+      for (const arg of args) this.analyze(arg, input);
+      return StreamType.one(JType.string());
+    }
+    if (name === "fromjson" && args.length === 0) {
+      return StreamType.one("Unknown");
+    }
+    if (name === "split" && (args.length === 1 || args.length === 2)) {
+      for (const arg of args) this.analyze(arg, input);
+      return StreamType.one(JType.array(JType.string()));
+    }
+    if (name === "splits" && (args.length === 1 || args.length === 2)) {
+      for (const arg of args) this.analyze(arg, input);
+      return StreamType.zeroOrMore(JType.string());
+    }
+    if (name === "explode" && args.length === 0) {
+      return StreamType.one(JType.array(JType.number()));
+    }
+    if (name === "implode" && args.length === 0) {
+      return StreamType.one(JType.string());
+    }
+    if (name === "ascii" && args.length === 0) {
+      return StreamType.one(JType.string());
+    }
+    if (name === "env" && args.length === 0) {
+      return StreamType.one(JType.object({}, JType.string()));
+    }
+    if ((name === "$__loc__" || name === "input_line_number") && args.length === 0) {
+      return StreamType.one("Unknown");
+    }
+    if (name === "error" && args.length === 0) {
+      return StreamType.zero();
+    }
+    if (name === "error" && args.length === 1) {
+      this.analyze(args[0]!, input);
+      return StreamType.zero();
+    }
+    if (name === "debug" && args.length === 0) {
+      return StreamType.one(input);
+    }
+    if (name === "debug" && args.length === 1) {
+      this.analyze(args[0]!, input);
+      return StreamType.one(input);
+    }
+    if (name === "stderr" && args.length === 0) {
+      return StreamType.one(input);
+    }
+    if (name === "to_entries" && args.length === 0) {
+      return StreamType.one(this.toEntriesType(input));
+    }
+    if (name === "from_entries" && args.length === 0) {
+      return StreamType.one(this.fromEntriesType(input));
+    }
+    if (name === "with_entries" && args.length === 1) {
+      return StreamType.one(this.withEntriesType(args[0]!, input));
+    }
+    if (name === "match" && (args.length === 1 || args.length === 2)) {
+      for (const arg of args) this.analyze(arg, input);
+      return StreamType.zeroOrMore(regexMatchType());
+    }
+    if (name === "capture" && (args.length === 1 || args.length === 2)) {
+      for (const arg of args) this.analyze(arg, input);
+      return StreamType.zeroOrMore(
+        JType.object({}, JType.union([JType.string(), "Null"])),
+      );
+    }
+    if (name === "scan" && (args.length === 1 || args.length === 2)) {
+      for (const arg of args) this.analyze(arg, input);
+      return StreamType.zeroOrMore(
+        JType.union([JType.string(), JType.array(JType.string())]),
+      );
+    }
+    if ((name === "gsub" || name === "sub") && (args.length === 2 || args.length === 3)) {
+      for (const arg of args) this.analyze(arg, input);
+      return StreamType.one(JType.string());
+    }
+    if (name === "limit" && args.length === 2) {
+      this.analyze(args[0]!, input);
+      const stream = this.analyze(args[1]!, input);
+      return StreamType.zeroOrMore(stream.item);
+    }
+    if ((name === "first" || name === "last") && args.length === 1) {
+      const stream = this.analyze(args[0]!, input);
+      return StreamType.zeroOrOne(stream.item);
+    }
+    if (name === "nth" && args.length === 2) {
+      this.analyze(args[0]!, input);
+      const stream = this.analyze(args[1]!, input);
+      return StreamType.zeroOrOne(stream.item);
+    }
+    if (name === "isempty" && args.length === 1) {
+      this.analyze(args[0]!, input);
+      return StreamType.one(JType.bool());
+    }
     return this.unsupported(
       `unsupported builtin or call \`${name}\``,
       "Unknown",
       this.spanForToken(name),
     );
+  }
+
+  sameArrayType(input: JTypeT): JTypeT {
+    if (typeof input === "object") {
+      if ("Array" in input) return input;
+      if ("Union" in input) return JType.union(input.Union.map((item) => this.sameArrayType(item)));
+    }
+    if (input === "Null" && this.missingPathNull) {
+      this.missingPathNull = false;
+      return "Unknown";
+    }
+    if (input === "Unknown") return JType.array("Unknown");
+    this.warnOrError(`expected array input, got: ${JType.toCompactString(input)}`);
+    return "Unknown";
+  }
+
+  sameArrayOrString(input: JTypeT): JTypeT {
+    if (typeof input === "object") {
+      if ("Array" in input || "String" in input) return input;
+      if ("Union" in input) {
+        return JType.union(input.Union.map((item) => this.sameArrayOrString(item)));
+      }
+    }
+    if (input === "Unknown") return "Unknown";
+    this.warnOrError(`expected array or string input, got: ${JType.toCompactString(input)}`);
+    return "Unknown";
+  }
+
+  arrayItemOrNull(input: JTypeT): JTypeT {
+    if (typeof input === "object") {
+      if ("Array" in input) return JType.union([input.Array.items, "Null"]);
+      if ("Union" in input) {
+        return JType.union(input.Union.map((item) => this.arrayItemOrNull(item)));
+      }
+    }
+    if (input === "Unknown") return "Unknown";
+    if (input === "Null") return "Null";
+    this.warnOrError(`expected array input, got: ${JType.toCompactString(input)}`);
+    return "Unknown";
+  }
+
+  groupByType(input: JTypeT): JTypeT {
+    if (typeof input === "object") {
+      if ("Array" in input) return JType.array(JType.array(input.Array.items));
+      if ("Union" in input) {
+        return JType.union(input.Union.map((item) => this.groupByType(item)));
+      }
+    }
+    if (input === "Unknown") return JType.array(JType.array("Unknown"));
+    this.warnOrError(`group_by expected array input, got: ${JType.toCompactString(input)}`);
+    return "Unknown";
+  }
+
+  walkType(f: ExpressionAst, input: JTypeT): JTypeT {
+    const descended = JType.recursiveDescent(input);
+    const mapped = this.analyze(f, descended).item;
+    return JType.union([input, mapped]);
+  }
+
+  toEntriesType(input: JTypeT): JTypeT {
+    let valueTy: JTypeT;
+    if (typeof input === "object" && "Object" in input) {
+      const values: JTypeT[] = Object.values(input.Object.properties).map((p) => p.ty);
+      if (input.Object.additional !== null) values.push(input.Object.additional);
+      valueTy = JType.union(values);
+    } else if (input === "Unknown") {
+      valueTy = "Unknown";
+    } else if (typeof input === "object" && "Union" in input) {
+      return JType.union(input.Union.map((item) => this.toEntriesType(item)));
+    } else {
+      this.warnOrError(`to_entries expected object input, got: ${JType.toCompactString(input)}`);
+      return "Unknown";
+    }
+    return JType.array(
+      JType.closedObject({
+        key: { ty: JType.string(), required: true },
+        value: { ty: valueTy, required: true },
+      }),
+    );
+  }
+
+  fromEntriesType(input: JTypeT): JTypeT {
+    if (typeof input === "object") {
+      if ("Array" in input) {
+        const item = input.Array.items;
+        if (typeof item === "object" && "Object" in item) {
+          const valueTy =
+            item.Object.properties["value"]?.ty ??
+            item.Object.properties["v"]?.ty ??
+            "Unknown";
+          return JType.object({}, valueTy);
+        }
+        return JType.object({}, "Unknown");
+      }
+      if ("Union" in input) {
+        return JType.union(input.Union.map((item) => this.fromEntriesType(item)));
+      }
+    }
+    if (input === "Unknown") return JType.object({}, "Unknown");
+    this.warnOrError(`from_entries expected array input, got: ${JType.toCompactString(input)}`);
+    return "Unknown";
+  }
+
+  withEntriesType(f: ExpressionAst, input: JTypeT): JTypeT {
+    const entries = this.toEntriesType(input);
+    let mapped: JTypeT;
+    if (typeof entries === "object" && "Array" in entries) {
+      mapped = this.analyze(f, entries.Array.items).item;
+    } else {
+      mapped = this.analyze(f, entries).item;
+    }
+    return this.fromEntriesType(JType.array(mapped));
   }
 
   analyzePredicate(expr: ExpressionAst, input: JTypeT): PredicateRefinement {
@@ -1273,10 +1720,35 @@ class Analyzer {
         const updated = this.writeArrayIndex(base, value);
         return this.writeFilterPath(input, target.expr, updated);
       }
+      case "slice": {
+        if (target.from !== undefined) this.analyze(target.from, input);
+        if (target.to !== undefined) this.analyze(target.to, input);
+        const base = this.analyze(target.expr, input).item;
+        const updated = this.writeSlice(base, value);
+        return this.writeFilterPath(input, target.expr, updated);
+      }
       default:
         this.warnOrError("assignment left-hand side is not a supported identity-root path");
         return "Unknown";
     }
+  }
+
+  writeSlice(input: JTypeT, value: JTypeT): JTypeT {
+    const rhsItem =
+      typeof value === "object" && "Array" in value ? value.Array.items : "Unknown";
+    if (typeof input === "object") {
+      if ("Array" in input) {
+        return JType.array(JType.union([input.Array.items, rhsItem]));
+      }
+      if ("Union" in input) {
+        return JType.union(input.Union.map((item) => this.writeSlice(item, value)));
+      }
+    }
+    if (input === "Null" || input === "Unknown") return JType.array(rhsItem);
+    this.warnOrError(
+      `slice assignment may be applied to non-array input: ${JType.toCompactString(input)}`,
+    );
+    return "Unknown";
   }
 
   writeIndex(
@@ -1582,6 +2054,60 @@ function notType(input: JTypeT): JTypeT {
   return truthy === null ? JType.bool() : JType.boolLit(!truthy);
 }
 
+function delType(input: JTypeT): JTypeT {
+  if (typeof input === "object") {
+    if ("Object" in input) {
+      const props: Record<string, Property> = {};
+      for (const [key, prop] of Object.entries(input.Object.properties)) {
+        props[key] = { ...prop, required: false };
+      }
+      return JType.object(
+        props,
+        input.Object.additional ?? "Unknown",
+      );
+    }
+    if ("Array" in input) return JType.array(input.Array.items);
+    if ("Union" in input) return JType.union(input.Union.map(delType));
+  }
+  if (input === "Unknown") return "Unknown";
+  return input;
+}
+
+function trimStrType(input: JTypeT): JTypeT {
+  if (typeof input === "object") {
+    if ("String" in input) return JType.string();
+    if ("Union" in input) return JType.union(input.Union.map(trimStrType));
+  }
+  if (input === "Unknown") return "Unknown";
+  return input;
+}
+
+function asciiDowncaseType(input: JTypeT): JTypeT {
+  if (typeof input === "object") {
+    if ("Union" in input) return JType.union(input.Union.map(asciiDowncaseType));
+    if ("String" in input && input.String !== "Any") {
+      return JType.stringLit(input.String.Literal.toLowerCase());
+    }
+  }
+  if (input === "Never") return "Never";
+  return JType.string();
+}
+
+function regexMatchType(): JTypeT {
+  const captureObj = JType.closedObject({
+    offset: { ty: JType.number(), required: true },
+    length: { ty: JType.number(), required: true },
+    string: { ty: JType.union([JType.string(), "Null"]), required: true },
+    name: { ty: JType.union([JType.string(), "Null"]), required: true },
+  });
+  return JType.closedObject({
+    offset: { ty: JType.number(), required: true },
+    length: { ty: JType.number(), required: true },
+    string: { ty: JType.string(), required: true },
+    captures: { ty: JType.array(captureObj), required: true },
+  });
+}
+
 function asciiUpcaseType(input: JTypeT): JTypeT {
   if (typeof input === "object") {
     if ("Union" in input) return JType.union(input.Union.map(asciiUpcaseType));
@@ -1627,6 +2153,106 @@ function isNumberLike(input: JTypeT): boolean {
 
 function normalizeVarName(name: string): string {
   return name.startsWith("$") ? name.slice(1) : name;
+}
+
+// Kept around for the future: full object/array destructuring support is
+// currently disabled in `withSimpleDestructuring` to stay aligned with jaq
+// (which fails to parse these patterns). Re-enable both sides together if
+// jaq adds support.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function collectDestructuringBindings(
+  pattern: DestructuringAst,
+  ty: JTypeT,
+): Map<string, JTypeT> {
+  const out = new Map<string, JTypeT>();
+  walkDestructuring(pattern, ty, out);
+  return out;
+}
+
+function walkDestructuring(
+  pattern: DestructuringAst,
+  ty: JTypeT,
+  out: Map<string, JTypeT>,
+): void {
+  if (pattern.type === "var") {
+    const name = normalizeVarName(pattern.name);
+    out.set(name, ty);
+    return;
+  }
+  if (pattern.type === "arrayDestructuring") {
+    walkArrayDestructuring(pattern, ty, out);
+    return;
+  }
+  if (pattern.type === "objectDestructuring") {
+    walkObjectDestructuring(pattern, ty, out);
+  }
+}
+
+function walkArrayDestructuring(
+  pattern: ArrayDestructuringAst,
+  ty: JTypeT,
+  out: Map<string, JTypeT>,
+): void {
+  const itemTy = arrayItemFor(ty);
+  for (const child of pattern.destructuring) {
+    walkDestructuring(child, itemTy, out);
+  }
+}
+
+function arrayItemFor(ty: JTypeT): JTypeT {
+  if (ty === "Unknown") return "Unknown";
+  if (typeof ty === "object") {
+    if ("Array" in ty) return JType.union([ty.Array.items, "Null"]);
+    if ("Union" in ty) {
+      return JType.union(ty.Union.map(arrayItemFor));
+    }
+  }
+  return "Null";
+}
+
+function walkObjectDestructuring(
+  pattern: ObjectDestructuringAst,
+  ty: JTypeT,
+  out: Map<string, JTypeT>,
+): void {
+  for (const entry of pattern.entries) {
+    const keyLit = objectDestructuringKey(entry.key);
+    if (entry.destructuring === undefined) {
+      const name = normalizeVarName((entry.key as { name: string }).name);
+      const valueTy = keyLit !== null ? objectFieldFor(ty, keyLit) : "Unknown";
+      out.set(name, valueTy);
+      continue;
+    }
+    const valueTy = keyLit !== null ? objectFieldFor(ty, keyLit) : "Unknown";
+    walkDestructuring(entry.destructuring, valueTy, out);
+  }
+}
+
+function objectDestructuringKey(
+  key: { type: "var"; name: string } | ExpressionAst | string,
+): string | null {
+  if (typeof key === "string") return key;
+  if ("type" in key) {
+    if (key.type === "str" && key.interpolated === false) return key.value;
+    if (key.type === "var") return normalizeVarName(key.name);
+  }
+  return null;
+}
+
+function objectFieldFor(ty: JTypeT, key: string): JTypeT {
+  if (ty === "Unknown") return "Unknown";
+  if (typeof ty === "object") {
+    if ("Object" in ty) {
+      const prop = ty.Object.properties[key];
+      if (prop) return prop.required ? prop.ty : JType.union([prop.ty, "Null"]);
+      if (ty.Object.additional !== null) return JType.union([ty.Object.additional, "Null"]);
+      return "Null";
+    }
+    if ("Union" in ty) {
+      return JType.union(ty.Union.map((item) => objectFieldFor(item, key)));
+    }
+  }
+  return "Null";
 }
 
 function literalStringFilter(expr: ExpressionAst): string | null {

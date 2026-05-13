@@ -392,6 +392,70 @@ const cases: Case[] = [
     inputSchema: {},
     inputs: [null, { ignored: true }],
   },
+  {
+    name: "recursive descent over object",
+    filter: "[.. | numbers]",
+    inputSchema: rowsByTeamSchema,
+    inputs: [
+      {
+        data: {
+          rows: [
+            { team_id: 1, name: "Platform" },
+            { team_id: 2, name: "Security" },
+          ],
+        },
+      },
+    ],
+  },
+  {
+    name: "sort_by preserves array item type",
+    filter: ".items | sort_by(.id) | .[0]",
+    inputSchema: usersSchema,
+    inputs: [usersSample],
+  },
+  {
+    name: "group_by returns nested arrays",
+    filter: ".items | group_by(.id) | length",
+    inputSchema: usersSchema,
+    inputs: [usersSample],
+  },
+  {
+    name: "to_entries / from_entries roundtrip",
+    // Use full object to avoid Union-on-pipe associativity divergence between parsers
+    filter: ". | to_entries | from_entries",
+    inputSchema: usersSchema,
+    inputs: [usersSample],
+  },
+  {
+    name: "non-recursive def",
+    filter: "def increment: . + 1; .items | map(.id | increment)",
+    inputSchema: usersSchema,
+    inputs: [usersSample],
+  },
+  {
+    name: "def with filter argument",
+    filter: "def doubled(f): f * 2; .items | map(.id | doubled(.))",
+    inputSchema: usersSchema,
+    inputs: [usersSample],
+  },
+  {
+    name: "format @json over input",
+    filter: ".items[0] | @json",
+    inputSchema: usersSchema,
+    inputs: [usersSample],
+  },
+  {
+    name: "split on string",
+    filter: '.items[0].name | split("")',
+    inputSchema: usersSchema,
+    inputs: [usersSample],
+  },
+  {
+    name: "startswith returns bool",
+    filter: '.items[0].name | startswith("A")',
+    inputSchema: usersSchema,
+    inputs: [usersSample],
+  },
 ];
 
 function which(cmd: string): string | null {

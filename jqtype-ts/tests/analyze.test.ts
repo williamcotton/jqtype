@@ -206,6 +206,29 @@ describe("analyzer — small cases", () => {
     });
   });
 
+  it("dynamic index expressions are analyzed for diagnostics", () => {
+    const input = JType.closedObject({
+      id: JType.property(JType.string(), true),
+    });
+
+    const unbound = check(".[$keyNonExistant]", input);
+    expect(
+      unbound.diagnostics.some((d) =>
+        d.message.includes("unbound jq variable: $keyNonExistant"),
+      ),
+    ).toBe(true);
+
+    const missingField = check(".[.keyNonExistant]", input);
+    const diagnostic = missingField.diagnostics.find((d) =>
+      d.message.includes('property "keyNonExistant" is not present'),
+    );
+    const start = ".[.keyNonExistant]".indexOf(".keyNonExistant");
+    expect(diagnostic?.span).toEqual({
+      start,
+      end: start + ".keyNonExistant".length,
+    });
+  });
+
   it("type predicate refines unknown", () => {
     const r = check('if type == "array" then [.[]] else null end', "Unknown");
     expect(StreamType.toCompactString(r.output)).toBe(
@@ -1084,6 +1107,18 @@ describe("analyzer — small cases", () => {
     const r = check('startswith("foo")', JType.string());
     expect(r.unsupported_features).toHaveLength(0);
     expect(StreamType.toCompactString(r.output)).toBe("boolean");
+  });
+
+  it("index returns number or null", () => {
+    const r = check('index("foo")', JType.string());
+    expect(r.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(r.output)).toBe("null | number");
+  });
+
+  it("first returns the first array item or null", () => {
+    const r = check("first", JType.array(JType.string()));
+    expect(r.unsupported_features).toHaveLength(0);
+    expect(StreamType.toCompactString(r.output)).toBe("null | string");
   });
 
   it("split returns string array", () => {

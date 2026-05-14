@@ -1,6 +1,6 @@
 {
   "name": "jqtype",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "TypeScript port of jqtype: static type analysis for jq filters, intended for embedding in language servers.",
   "type": "module",
   "sideEffects": false,

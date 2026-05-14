@@ -462,6 +462,18 @@ const cases: Case[] = [
     inputSchema: usersSchema,
     inputs: [usersSample],
   },
+  {
+    name: "first array item",
+    filter: ".items | first",
+    inputSchema: usersSchema,
+    inputs: [usersSample, emptyUsers],
+  },
+  {
+    name: "index returns position or null",
+    filter: '.items | first | .name | index("a")',
+    inputSchema: usersSchema,
+    inputs: [usersSample, emptyUsers],
+  },
 ];
 
 function which(cmd: string): string | null {

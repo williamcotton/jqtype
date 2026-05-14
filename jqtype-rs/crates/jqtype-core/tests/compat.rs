@@ -365,6 +365,18 @@ fn cases() -> Vec<Case> {
             ],
         },
         Case {
+            name: "first array item",
+            filter: ".items | first",
+            input_schema: users_schema.clone(),
+            inputs: vec![users_sample.clone(), empty_users],
+        },
+        Case {
+            name: "index returns position or null",
+            filter: ".items | first | .name | index(\"a\")",
+            input_schema: users_schema.clone(),
+            inputs: vec![users_sample.clone(), json!({"items": []})],
+        },
+        Case {
             name: "add and join builtins",
             filter: "{ total: ([10, 20, 30] | add), joined: (.items | map(.id | tostring) | join(\",\")) }",
             input_schema: users_schema,

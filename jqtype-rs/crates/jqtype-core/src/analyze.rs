@@ -1242,6 +1242,10 @@ impl Analyzer {
                 let _ = self.analyze(arg, input);
                 StreamType::one(JType::bool())
             }
+            ("index", [arg]) => {
+                let _ = self.analyze(arg, input);
+                StreamType::one(JType::union([JType::number(), JType::Null]))
+            }
             ("startswith", [arg]) | ("endswith", [arg]) => {
                 let _ = self.analyze(arg, input);
                 StreamType::one(JType::bool())
@@ -1348,6 +1352,7 @@ impl Analyzer {
                 let stream = self.analyze(generator, input);
                 StreamType::zero_or_more(stream.item)
             }
+            ("first", []) => StreamType::one(self.first_type(input)),
             ("first", [generator]) => {
                 let stream = self.analyze(generator, input);
                 StreamType::zero_or_one(stream.item)
@@ -1736,6 +1741,34 @@ impl Analyzer {
             JType::Unknown => JType::Unknown,
             JType::Null => JType::Null,
             other => {
+                self.warn_or_error(
+                    format!("expected array input, got: {}", other.to_compact_string()),
+                    None,
+                );
+                JType::Unknown
+            }
+        }
+    }
+
+    fn first_type(&mut self, input: JType) -> JType {
+        match input {
+            JType::Array(array) => {
+                self.missing_path_null = false;
+                JType::union([*array.items, JType::Null])
+            }
+            JType::Null => {
+                self.missing_path_null = false;
+                JType::Null
+            }
+            JType::Union(items) => {
+                JType::union(items.into_iter().map(|item| self.first_type(item)))
+            }
+            JType::Unknown => {
+                self.missing_path_null = false;
+                JType::Unknown
+            }
+            other => {
+                self.missing_path_null = false;
                 self.warn_or_error(
                     format!("expected array input, got: {}", other.to_compact_string()),
                     None,
@@ -4675,6 +4708,20 @@ mod tests {
         let report = check(r#"startswith("foo")"#, JType::string());
         assert!(report.unsupported_features.is_empty());
         assert_eq!(report.output.to_compact_string(), "boolean");
+    }
+
+    #[test]
+    fn index_returns_number_or_null() {
+        let report = check(r#"index("foo")"#, JType::string());
+        assert!(report.unsupported_features.is_empty());
+        assert_eq!(report.output.to_compact_string(), "null | number");
+    }
+
+    #[test]
+    fn first_zero_arg_returns_array_item_or_null() {
+        let report = check("first", JType::array(JType::string()));
+        assert!(report.unsupported_features.is_empty());
+        assert_eq!(report.output.to_compact_string(), "null | string");
     }
 
     #[test]

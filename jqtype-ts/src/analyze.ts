@@ -953,7 +953,12 @@ class Analyzer {
     if (index.type === "str" && index.interpolated === false) {
       return this.accessField(input, index.value, optional, span ?? this.spanForExpr(index));
     }
-    return this.accessDynamicIndex(input, optional);
+    const key = this.analyze(index, input);
+    const value = this.accessDynamicIndex(input, optional);
+    return StreamType.new(
+      value.item,
+      Cardinality.compose(key.card, value.card),
+    );
   }
 
   accessField(
@@ -1497,6 +1502,10 @@ class Analyzer {
       this.analyze(args[0]!, input);
       return StreamType.one(JType.bool());
     }
+    if (name === "index" && args.length === 1) {
+      this.analyze(args[0]!, input);
+      return StreamType.one(JType.union([JType.number(), "Null"]));
+    }
     if ((name === "startswith" || name === "endswith") && args.length === 1) {
       this.analyze(args[0]!, input);
       return StreamType.one(JType.bool());
@@ -1593,6 +1602,9 @@ class Analyzer {
       const stream = this.analyze(args[1]!, input);
       return StreamType.zeroOrMore(stream.item);
     }
+    if (name === "first" && args.length === 0) {
+      return StreamType.one(this.firstType(input));
+    }
     if ((name === "first" || name === "last") && args.length === 1) {
       const stream = this.analyze(args[0]!, input);
       return StreamType.zeroOrOne(stream.item);
@@ -1648,6 +1660,29 @@ class Analyzer {
     }
     if (input === "Unknown") return "Unknown";
     if (input === "Null") return "Null";
+    this.warnOrError(`expected array input, got: ${JType.toCompactString(input)}`);
+    return "Unknown";
+  }
+
+  firstType(input: JTypeT): JTypeT {
+    if (typeof input === "object") {
+      if ("Array" in input) {
+        this.missingPathNull = false;
+        return JType.union([input.Array.items, "Null"]);
+      }
+      if ("Union" in input) {
+        return JType.union(input.Union.map((item) => this.firstType(item)));
+      }
+    }
+    if (input === "Null") {
+      this.missingPathNull = false;
+      return "Null";
+    }
+    if (input === "Unknown") {
+      this.missingPathNull = false;
+      return "Unknown";
+    }
+    this.missingPathNull = false;
     this.warnOrError(`expected array input, got: ${JType.toCompactString(input)}`);
     return "Unknown";
   }

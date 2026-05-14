@@ -903,7 +903,10 @@ impl Analyzer {
             BinaryOp::Comma => self
                 .analyze(left, input.clone())
                 .join(self.analyze(right, input)),
-            BinaryOp::Ord(_) | BinaryOp::Or | BinaryOp::And => StreamType::one(JType::bool()),
+            BinaryOp::Ord(_) | BinaryOp::Or | BinaryOp::And => {
+                self.analyze_boolean_operands(left, right, input);
+                StreamType::one(JType::bool())
+            }
             BinaryOp::Math(op) => {
                 let left = self.analyze(left, input.clone());
                 let right = self.analyze(right, input);
@@ -924,6 +927,18 @@ impl Analyzer {
             }
             BinaryOp::Assign(op) => self.analyze_assignment(left, op, right, input),
         }
+    }
+
+    fn analyze_boolean_operands(
+        &mut self,
+        left: &SpannedFilter,
+        right: &SpannedFilter,
+        input: JType,
+    ) {
+        self.with_fresh_missing_path_scope(|analyzer| {
+            let _ = analyzer.analyze(left, input.clone());
+            let _ = analyzer.analyze(right, input);
+        });
     }
 
     fn with_var<T>(&mut self, name: &str, ty: JType, f: impl FnOnce(&mut Self) -> T) -> T {
@@ -1366,19 +1381,23 @@ impl Analyzer {
         match &predicate.0 {
             Filter::Binary(left, BinaryOp::Ord(op @ (OrdOp::Eq | OrdOp::Ne)), right) => {
                 if let Some(kind) = type_comparison_kind(left, right) {
+                    self.analyze_boolean_operands(left, right, input.clone());
                     return self.refine_type_predicate(input, &kind, *op);
                 }
                 if let Some(kind) = type_comparison_kind(right, left) {
+                    self.analyze_boolean_operands(left, right, input.clone());
                     return self.refine_type_predicate(input, &kind, *op);
                 }
                 if let (Some(field), Some(literal)) =
                     (top_level_field_access(left), literal_type_filter(right))
                 {
+                    self.analyze_boolean_operands(left, right, input.clone());
                     return self.refine_field_literal_predicate(input, &field, literal, *op);
                 }
                 if let (Some(field), Some(literal)) =
                     (top_level_field_access(right), literal_type_filter(left))
                 {
+                    self.analyze_boolean_operands(left, right, input.clone());
                     return self.refine_field_literal_predicate(input, &field, literal, *op);
                 }
                 if let Some((field, kind)) = recognize_length_predicate(left, right, *op)
@@ -3576,6 +3595,64 @@ mod tests {
         assert_eq!(
             report.output.to_compact_string(),
             "Stream<string, ZeroOrOne>"
+        );
+    }
+
+    #[test]
+    fn comparison_predicates_analyze_operands_for_diagnostics() {
+        let input = json_schema_to_type(&json!({
+            "type": "object",
+            "properties": {
+                "teams": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": { "id": { "type": "string" } },
+                        "required": ["id"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["teams"],
+            "additionalProperties": false
+        }));
+
+        let direct_filter = "[.teams[] | select(.idNonExistant == \"1\")]";
+        let direct = check(direct_filter, input.clone());
+        let direct_diagnostic = direct
+            .diagnostics
+            .iter()
+            .find(|diag| {
+                diag.message
+                    .contains("property \"idNonExistant\" is not present")
+            })
+            .expect("missing direct comparison diagnostic");
+        let direct_start = direct_filter.find(".idNonExistant").unwrap();
+        assert_eq!(
+            direct_diagnostic.span,
+            Some(SourceSpan::new(
+                direct_start,
+                direct_start + ".idNonExistant".len()
+            ))
+        );
+
+        let piped_filter = "[.teams[] | select((.idNonExistant | tostring) == \"1\")]";
+        let piped = check(piped_filter, input);
+        let piped_diagnostic = piped
+            .diagnostics
+            .iter()
+            .find(|diag| {
+                diag.message
+                    .contains("property \"idNonExistant\" is not present")
+            })
+            .expect("missing piped comparison diagnostic");
+        let piped_start = piped_filter.find(".idNonExistant").unwrap();
+        assert_eq!(
+            piped_diagnostic.span,
+            Some(SourceSpan::new(
+                piped_start,
+                piped_start + ".idNonExistant".len()
+            ))
         );
     }
 

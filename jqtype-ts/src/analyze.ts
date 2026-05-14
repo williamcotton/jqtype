@@ -1197,9 +1197,13 @@ class Analyzer {
       );
     }
     if (op === "==" || op === "!=" || op === "<" || op === ">" || op === "<=" || op === ">=") {
+      this.analyzeBooleanOperands(node.left, node.right, input);
       return StreamType.one(JType.bool());
     }
-    if (op === "or" || op === "and") return StreamType.one(JType.bool());
+    if (op === "or" || op === "and") {
+      this.analyzeBooleanOperands(node.left, node.right, input);
+      return StreamType.one(JType.bool());
+    }
     if (op === "+" || op === "-" || op === "*" || op === "/" || op === "%") {
       const left = this.analyze(node.left, input);
       const right = this.analyze(node.right, input);
@@ -1235,6 +1239,13 @@ class Analyzer {
       "Unknown",
       this.spanForBinaryOperator(node) ?? this.spanForToken(op),
     );
+  }
+
+  analyzeBooleanOperands(left: ExpressionAst, right: ExpressionAst, input: JTypeT): void {
+    this.withFreshMissingPathScope(() => {
+      this.analyze(left, input);
+      this.analyze(right, input);
+    });
   }
 
   analyzeAssignment(
@@ -1719,18 +1730,26 @@ class Analyzer {
       const op = expr.operator;
       if (op === "==" || op === "!=") {
         const tk1 = typeComparisonKind(expr.left, expr.right);
-        if (tk1 !== null) return refineTypePredicate(input, tk1, op);
+        if (tk1 !== null) {
+          this.analyzeBooleanOperands(expr.left, expr.right, input);
+          return refineTypePredicate(input, tk1, op);
+        }
         const tk2 = typeComparisonKind(expr.right, expr.left);
-        if (tk2 !== null) return refineTypePredicate(input, tk2, op);
+        if (tk2 !== null) {
+          this.analyzeBooleanOperands(expr.left, expr.right, input);
+          return refineTypePredicate(input, tk2, op);
+        }
 
         const leftField = topLevelFieldAccess(expr.left);
         const rightLit = literalTypeFilter(expr.right);
         if (leftField !== null && rightLit !== null) {
+          this.analyzeBooleanOperands(expr.left, expr.right, input);
           return refineFieldLiteralPredicate(input, leftField, rightLit, op);
         }
         const rightField = topLevelFieldAccess(expr.right);
         const leftLit = literalTypeFilter(expr.left);
         if (rightField !== null && leftLit !== null) {
+          this.analyzeBooleanOperands(expr.left, expr.right, input);
           return refineFieldLiteralPredicate(input, rightField, leftLit, op);
         }
         const lengthMatch =

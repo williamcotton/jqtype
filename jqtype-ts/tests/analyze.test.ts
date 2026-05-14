@@ -138,6 +138,74 @@ describe("analyzer — small cases", () => {
     );
   });
 
+  it("comparison predicates analyze operands for diagnostics", () => {
+    const input = jsonSchemaToType({
+      type: "object",
+      properties: {
+        teams: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { id: { type: "string" } },
+            required: ["id"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["teams"],
+      additionalProperties: false,
+    });
+
+    const directFilter = '[.teams[] | select(.idNonExistant == "1")]';
+    const direct = check(directFilter, input);
+    const directDiagnostic = direct.diagnostics.find((d) =>
+      d.message.includes('property "idNonExistant" is not present'),
+    );
+    const directStart = directFilter.indexOf(".idNonExistant");
+    expect(directDiagnostic?.span).toEqual({
+      start: directStart,
+      end: directStart + ".idNonExistant".length,
+    });
+
+    const pipedFilter = '[.teams[] | select((.idNonExistant | tostring) == "1")]';
+    const piped = check(pipedFilter, input);
+    const pipedDiagnostic = piped.diagnostics.find((d) =>
+      d.message.includes('property "idNonExistant" is not present'),
+    );
+    const pipedStart = pipedFilter.indexOf(".idNonExistant");
+    expect(pipedDiagnostic?.span).toEqual({
+      start: pipedStart,
+      end: pipedStart + ".idNonExistant".length,
+    });
+  });
+
+  it("external variable comparison predicates analyze item operands", () => {
+    const filter = '[ $teams[] | select((.idNonExistant | tostring) == $key) ]';
+    const report = new JqTypeChecker().analyzeFilter(
+      filter,
+      InputShape.unknown(),
+      {
+        externalVars: {
+          teams: JType.array(
+            JType.closedObject({
+              id: JType.property(JType.string(), true),
+            }),
+          ),
+          key: JType.string(),
+        },
+      },
+    );
+    const diagnostic = report.diagnostics.find((d) =>
+      d.message.includes('property "idNonExistant" is not present'),
+    );
+    const start = filter.indexOf(".idNonExistant");
+
+    expect(diagnostic?.span).toEqual({
+      start,
+      end: start + ".idNonExistant".length,
+    });
+  });
+
   it("type predicate refines unknown", () => {
     const r = check('if type == "array" then [.[]] else null end', "Unknown");
     expect(StreamType.toCompactString(r.output)).toBe(
